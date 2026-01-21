@@ -1,96 +1,103 @@
+import threading
 import requests
-import re  # 정규식 모듈
 import config
-from memory_handler import MemoryManager
-import threading # 회고 기능을 비동기로 돌리기 위해 (선택사항)
-
-BOT_PERSONA = config.BOT_PERSONA
+import re
+from memory_structures import ImportanceScorer
+from memory_handler import FastSTM, SlowLTM
 
 class LLMHandler:
     def __init__(self):
-        self.api_key = config.LLM_API_KEY
-        self.url = "https://api.openai.com/v1/chat/completions"
+        self.scorer = ImportanceScorer(bot_name="잼봇")
+        self.stm = FastSTM(capacity=15) # 단기 기억 용량
+        self.ltm = SlowLTM()            # 장기 기억 관리자
+        
         self.headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {config.LLM_API_KEY}",
             "Content-Type": "application/json",
         }
-        self.memory_manager = MemoryManager()
-        self.turn_count = 0 # 회고 주기 체크용
 
-    def get_response(self, history, current_user_query=None):
-        self.turn_count += 1
-        
-        # 0. 들어온 메시지 즉시 스타일 분석 (Regex - Fast)
+    def get_response(self, history, current_query=None):
+        # 1. [System 1] 입력된 메시지 중요도 채점 및 STM 저장
         if history:
             last_msg = history[-1]
-            if str(last_msg.get('user_id')) != str(config.BOT_USER_ID):
-                self.memory.analyze_and_update_style(last_msg.get('user_id'), last_msg.get('msg', ''))
+            uid = str(last_msg.get('user_id'))
+            msg = last_msg.get('msg', '')
+            role = "assistant" if uid == str(config.BOT_USER_ID) else "user"
+            
+            # ⚡ NLP 기반 즉시 채점 (LLM 호출 X)
+            importance = self.scorer.score(msg, role)
+            
+            # STM에 저장 (용량 차면 자동으로 Buffer로 밀려남)
+            self.stm.add(msg, uid, role, importance)
 
-        # 1. 프롬프트 구성을 위한 데이터 준비
-        # 현재 대화에 참여 중인 유저들의 ID 추출 (최근 10개 메시지 기준)
-        active_users = list(set([str(h.get('user_id')) for h in history[-10:] if str(h.get('user_id')) != str(config.BOT_USER_ID)]))
+        # 2. [Context Building] 프롬프트 구성
+        # 2-1. STM에서 살아남은 '중요한 단기 기억' 가져오기
+        active_stm = self.stm.get_working_context()
+        stm_context = "\n".join([f"{m.user_id}: {m.content}" for m in active_stm])
         
-        # 기억(Memory) + 스타일(Style) 로딩
-        memory_context = self.memory.get_user_context(active_users)
-        
-        # In-Context Learning을 위한 실제 대화 예시 (최근 3개만, 토큰 절약)
-        recent_examples = "\n".join([f"{h.get('user_name', 'User')}: {h.get('msg')}" for h in history[-3:]])
+        # 2-2. 현재 참여자의 LTM(장기 기억) 가져오기
+        active_users = list(set([m.user_id for m in active_stm if m.role == 'user']))
+        ltm_context = self.ltm.get_context_string(active_users)
 
-        # 2. 시스템 프롬프트 조립 (페르소나 + 기억 + 지침)
         system_prompt = f"""
-{BOT_PERSONA}
+{config.BOT_PERSONA}
 
-[현재 대화 참여자 정보 (기억 데이터)]
-{memory_context}
+[Long-term Memory: 유저 정보]
+{ltm_context}
 
-[행동 지침]
-1. 위 '기억 데이터'를 참고하여 아는 척을 해라.
-2. 사용자의 말투 특징(반말/존댓말 등)이 정보에 있다면 그에 맞춰 '미러링(Mirroring)' 해라.
-3. 현재 대화 흐름상 네가 굳이 끼어들 필요가 없거나, 할 말이 없으면 고민하지 말고 
-   반드시 `[PASS]` 라고만 출력해라. (매우 중요: 눈치 없이 아무 때나 끼어들지 말 것)
-4. 답변은 JSON이 아닌 자연스러운 텍스트로 해라.
+[Working Memory: 현재 대화 흐름]
+(오래된 잡담은 사라지고 중요한 맥락만 남아있다)
+{stm_context}
 
-[최근 대화 분위기 참고]
-{recent_examples}
+[Instruction]
+1. 위 기억을 바탕으로 자연스럽게 대화해라.
+2. 할 말이 없거나 끼어들 타이밍이 아니면 `[PASS]` 라고만 출력해라.
 """
+        # 메시지 구성 (최근 3개만 Raw로 넣어서 토큰 절약, 나머지는 Context로 대체)
+        messages = [{"role": "system", "content": system_prompt}]
+        if current_query:
+            messages.append({"role": "user", "content": current_query})
 
-        input_messages = [{"role": "system", "content": system_prompt}]
-        
-        # 히스토리 주입 (토큰 효율을 위해 최근 15개)
-        for h in history[-15:]:
-            role = "assistant" if str(h.get("user_id")) == str(config.BOT_USER_ID) else "user"
-            prefix = f"{h.get('user_name', 'User')}: " if role == "user" else ""
-            input_messages.append({"role": role, "content": f"{prefix}{h.get('msg')}"})
-
-        if current_user_query:
-            input_messages.append({"role": "user", "content": current_user_query})
-
-        # 3. LLM API 호출
-        payload = {
-            "model": config.LLM_MODEL,
-            "messages": input_messages,
-            "temperature": 0.8, # 페르소나 연기를 위해 약간 창의적으로
-            "max_tokens": 800
-        }
-
+        # 3. [Generation] LLM 응답 생성
         try:
-            # 5턴마다 비동기 회고 실행 (기억 업데이트)
-            if self.turn_count % 5 == 0:
-                self.memory.reflect_async(history[-10:])
-
-            r = requests.post(self.url, headers=self.headers, json=payload, timeout=10)
+            payload = {
+                "model": config.LLM_MODEL,
+                "messages": messages,
+                "temperature": 0.8,
+                "max_tokens": 300
+            }
+            r = requests.post("https://api.openai.com/v1/chat/completions", headers=self.headers, json=payload, timeout=10)
+            
             if r.status_code == 200:
                 content = r.json()['choices'][0]['message']['content'].strip()
                 
-                # [PASS] 토큰 감지 (Regex) - 대소문자/괄호 변형 대응
                 if re.search(r"\[PASS\]", content, re.IGNORECASE):
-                    print(f"🤫 봇 침묵 (Reason: {content})")
+                    # 봇이 침묵을 선택해도, 내부적으로 메모리 정리는 수행해야 함
+                    self._check_and_trigger_consolidation()
                     return None
+
+                # 4. [Feedback Loop] 봇의 답변도 STM에 저장 (대화 맥락 유지)
+                bot_importance = self.scorer.score(content, "assistant")
+                self.stm.add(content, str(config.BOT_USER_ID), "assistant", bot_importance)
+                
+                # 5. [System 2] 백그라운드 메모리 정리 트리거
+                self._check_and_trigger_consolidation()
                 
                 return content
             
-            else:
-                return f"🤖 (오류: {r.status_code})"
-
         except Exception as e:
-            return f"🤖 (연결 실패: {e})"
+            print(f"Error: {e}")
+            return None
+
+    def _check_and_trigger_consolidation(self):
+        """
+        Buffer에 밀려난 기억이 5개 이상 쌓이면 별도 스레드에서 LTM 저장(Consolidation) 실행.
+        메인 대화 속도에 영향 주지 않음.
+        """
+        if len(self.stm.transfer_buffer) >= 5:
+            buffer_snapshot = self.stm.transfer_buffer[:] # 복사
+            self.stm.transfer_buffer = [] # 버퍼 비우기
+            
+            # 비동기 실행
+            t = threading.Thread(target=self.ltm.consolidate, args=(buffer_snapshot,))
+            t.start()
