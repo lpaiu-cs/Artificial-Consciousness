@@ -1,10 +1,10 @@
-# 🧠 CogBot: 인지 심리학 기반 그룹 챗봇 (Cognitive Group Chatbot)
+# 🧠 CogBot: 인간 수준의 상호작용을 위한 인지 아키텍처 챗봇
 
-> **"단순한 검색(RAG)을 넘어, 인간처럼 기억하고 망각하며, 눈치껏 대화하는 AI 에이전트"**
+> **"단순한 검색(RAG)을 넘어, 감정을 느끼고 관계를 이해하며, 스스로 생각하는 AI 에이전트"**
 
-CogBot은 단순한 질의응답 시스템이 아닙니다. 인간의 인지 과정(Cognitive Process)을 모사하여, **단기 기억(STM)**과 **장기 기억(LTM)**을 유기적으로 순환시키는 **이원화된 메모리 아키텍처(Dual-Process Memory Architecture)**를 탑재했습니다.
+CogBot은 인지 심리학 이론(Atkinson-Shiffrin, ACT-R, Bartlett)을 공학적으로 구현한 **이원화된 인지 아키텍처(Dual-Process Cognitive Architecture)** 기반의 챗봇 프레임워크입니다.
 
-다자간 채팅 환경(Group Chat)에서 효율적인 토큰 사용과 자연스러운 상호작용을 위해 **System 1(직관/빠른 처리)**과 **System 2(사고/느린 처리)** 모델을 결합하였습니다.
+System 1(직관/빠른 처리)과 System 2(사고/느린 처리)의 유기적인 순환을 통해, 봇은 단순한 질의응답을 넘어 **자아(Self)**를 가지고 그룹 채팅 내에서 사회적 상호작용을 수행합니다.
 
 ---
 
@@ -12,49 +12,51 @@ CogBot은 단순한 질의응답 시스템이 아닙니다. 인간의 인지 과
 
 ### 1. 이원화된 메모리 시스템 (Dual-Memory System)
 
-* **System 1 (Fast STM):** 우선순위 큐(Priority Queue)를 사용하여 작업 기억을 관리합니다. 중요하지 않거나 오래된 기억은 자동으로 밀려납니다(Eviction).
-* **System 2 (Slow LTM):** 밀려난 기억들을 버리지 않고 모아서 비동기적으로 회고(Consolidation)합니다. LLM이 이를 분석해 '불변의 사실(Fact)'과 '추억(Episode)'으로 정제하여 영구 저장합니다.
+* **System 1 (Fast STM):** 작업 기억(Working Memory)을 **ACT-R 활성화 점수** 기반의 우선순위 큐로 관리합니다. 중요하지 않거나 오래된 기억은 자연스럽게 망각(Eviction)됩니다.
+* **System 2 (Slow LTM):** 망각된 기억을 버리지 않고 **성찰(Reflection)** 과정을 거칩니다. 파편화된 대화에서 '불변의 사실(Facts)'과 '통찰(Insights)'을 추출하여 영구 저장합니다.
 
-### 2. 비용 효율적인 중요도 평가 (Cost-Effective Scoring)
+### 2. 의미적 뇌 & 하이브리드 검색 (Semantic Brain)
 
-* 모든 메시지에 LLM을 사용하지 않습니다. **NLP 기반의 경량화된 Scorer**가 0.01초 만에 메시지의 중요도(감정, 정보성, 호출 여부 등)를 채점합니다.
-* "ㅋㅋ", "ㅇㅇ" 같은 단순 반응은 빠르게 망각되고, 중요한 정보는 오랫동안 단기 기억에 생존합니다.
+* 단순 키워드 매칭의 한계를 극복하기 위해 **Vector Embedding**과 **ACT-R Score**를 결합한 **하이브리드 검색(Hybrid Retrieval)**을 사용합니다.
+* "배고파"라고 말하면 "맛집", "식사" 관련 기억을 의미적으로 연결하여 떠올립니다.
 
-### 3. 눈치 챙기기 & 끼어들기 (Smart Interjection)
+### 3. 마음과 사회성 (Heart & Social Map)
 
-* 봇은 호출되지 않아도 대화 맥락을 읽습니다.
-* 할 말이 없거나 끼어들 타이밍이 아니라고 판단되면 `[PASS]` 토큰을 발행하여 침묵합니다. 이를 통해 "눈치 없는 봇" 문제를 해결했습니다.
+* **감정 엔진 (Bot's Heart):** 봇은 자신의 기분(Mood)을 가집니다. 유저의 말에 따라 기분이 고양되거나 나빠지며(Decay), 이는 다음 답변의 태도에 영향을 미칩니다.
+* **사회적 지도 (Social Map):** 유저별 **호감도(Affinity)**를 관리합니다. 친한 유저에게는 편하게 대하고, 낯선 유저에게는 예의를 차리는 등 '정치적 관계'를 형성합니다.
 
-### 4. 심층 페르소나 (Deep Persona)
+### 4. 메타 인지 (Meta-Cognition)
 
-* 1,000자 이상의 상세한 페르소나 정의를 통해 말투, 성격, 금기 사항 등을 일관되게 유지합니다. 단순한 프롬프트 지시를 넘어선 캐릭터 몰입감을 제공합니다.
+* 답변을 생성하기 전에 **내적 독백(Inner Monologue)**을 수행합니다.
+* **Think-Plan-Act** 루프를 통해 상황을 분석하고, 전략을 세운 뒤, 말할지 침묵할지(`[PASS]`) 스스로 결정합니다.
 
 ---
 
 ## 🏗️ 시스템 아키텍처 (Architecture)
 
-CogBot은 인간의 기억 처리 과정을 공학적으로 모델링했습니다.
-
 ```mermaid
 graph TD
-    User[사용자 입력] --> |NLP Scoring| Scorer{중요도 채점}
-    Scorer --> |Score & Content| STM["단기 기억 (Priority Queue)"]
+    User[사용자 입력] --> |NLP & Vector| Sensory["감각 등록기 (Sensory)"]
     
-    STM -- "용량 초과 (Eviction)" --> Buffer[망각 버퍼]
-    Buffer -- "주기적 실행 (Batch)" --> LTM_Manager["LTM 관리자 (System 2)"]
+    subgraph "System 1: Fast Process"
+        Sensory --> |Attention Score| STM["작업 기억 (Priority Queue)"]
+        Emotion["감정 엔진 (Heart)"] <--> Sensory
+        Social["사회성 엔진 (Social Map)"] <--> Sensory
+    end
     
-    LTM_Manager --> |"LLM 회고 (Consolidation)"| Facts["의미 기억 (Facts)"]
-    LTM_Manager --> |"LLM 회고 (Consolidation)"| Episodes["일화 기억 (Episodes)"]
+    subgraph "System 2: Slow Process"
+        STM -- "기억 방출 (Eviction)" --> Buffer["망각 버퍼"]
+        Buffer -- "주기적 실행 (Batch)" --> Reflector["성찰 & 공고화 (Reflection)"]
+        Reflector --> |Update| LTM["장기 기억 (Semantic/Episodic)"]
+    end
     
-    STM & Facts & Episodes --> |Context Injection| LLM["LLM (답변 생성)"]
-    LLM --> |Response / PASS| User
+    subgraph "Generation: Meta-Cognition"
+        STM & LTM --> |"Hybrid Retrieval"| Context["맥락 재구성 (Reconstruction)"]
+        Context & Emotion & Social --> Meta["메타 인지 (Think-Plan-Act)"]
+        Meta --> |Response / PASS| Action[최종 답변]
+    end
 
 ```
-
-1. **감각 등록 (Sensory):** 메시지가 들어오면 `ImportanceScorer`가 즉시 점수(1.0~10.0)를 매깁니다.
-2. **작업 기억 (Working Memory):** 점수에 따라 `FastSTM` 큐에 정렬됩니다. 용량이 차면 점수가 낮은 기억부터 방출됩니다.
-3. **기억 공고화 (Consolidation):** 방출된 기억은 `SlowLTM`이 수거하여, LLM을 통해 핵심 정보만 장기 기억으로 승격시킵니다.
-4. **인출 및 생성 (Retrieval & Generation):** 답변 시, 현재의 `STM`과 관련 있는 `LTM`을 프롬프트에 주입하여 답변을 생성합니다.
 
 ---
 
@@ -62,13 +64,15 @@ graph TD
 
 ```bash
 CogBot/
-├── config.py               # API Key, 페르소나, 모델 설정
-├── llm_handler.py          # 메인 컨트롤러 (입출력 및 오케스트레이션)
-├── memory_handler.py       # FastSTM(단기) 및 SlowLTM(장기) 클래스 구현
-├── memory_structures.py    # MemoryObject, ImportanceScorer(NLP) 구현
-├── ltm_storage.json        # 장기 기억 데이터베이스 (자동 생성)
-├── requirements.txt        # 의존성 패키지 목록
-└── README.md               # 문서
+├── config.py                 # API Key, 페르소나, 모델 설정
+├── llm_handler.py            # 메인 컨트롤러 (메타 인지 및 오케스트레이션)
+├── memory_handler.py         # FastSTM(단기) 및 SlowLTM(장기) 클래스
+├── memory_structures.py      # MemoryObject, CognitiveScorer(Attention)
+├── social_emotion_handler.py # 감정(Heart) 및 사회성(Social Map) 엔진
+├── vector_engine.py          # 임베딩 생성 및 유사도 계산 (Semantic Brain)
+├── cognitive_ltm.json        # 장기 기억 저장소 (자동 생성)
+├── social_affinity.json      # 사회적 관계 저장소 (자동 생성)
+└── requirements.txt          # 의존성 패키지
 
 ```
 
@@ -76,65 +80,52 @@ CogBot/
 
 ## 🚀 설치 및 시작 (Getting Started)
 
-### 1. 사전 요구 사항 (Prerequisites)
+### 1. 사전 요구 사항
 
-* Python 3.8 이상
-* OpenAI API Key (또는 호환되는 LLM API Key)
+* Python 3.9 이상
+* OpenAI API Key (Chat & Embedding 모델 사용)
 
-### 2. 설치 (Installation)
+### 2. 설치
 
 ```bash
-# 레포지토리 클론
 git clone https://github.com/your-username/CogBot.git
 cd CogBot
-
-# 의존성 설치
 pip install -r requirements.txt
 
 ```
 
-### 3. 설정 (Configuration)
-
-`config.py` 파일을 생성하고 다음과 같이 설정합니다.
+### 3. 설정 (`config.py`)
 
 ```python
-# config.py
+LLM_API_KEY = "sk-..."
+LLM_MODEL = "gpt-4o"  # JSON Mode 지원 모델 권장
+BOT_USER_ID = "999"
 
-LLM_API_KEY = "sk-your-openai-api-key-here"
-LLM_MODEL = "gpt-4o"  # 또는 gpt-3.5-turbo
-BOT_USER_ID = "999"   # 봇의 식별 ID
-
-# 1000자 이상의 상세 페르소나
 BOT_PERSONA = """
 [이름: 잼봇]
-너는 이 채팅방의 분위기 메이커이자 든든한 친구야.
-... (생략: 상세한 성격, 말투, 행동 지침) ...
+너는 눈치 빠르고 유머러스한 친구야.
+...(1000자 이상의 상세 페르소나)...
 """
 
 ```
 
-### 4. 실행 (Usage)
-
-메인 스크립트나 챗봇 인터페이스에서 `LLMHandler`를 인스턴스화하여 사용합니다.
+### 4. 실행 예시
 
 ```python
 from llm_handler import LLMHandler
 
 bot = LLMHandler()
 
-# 대화 기록 예시 (실제로는 카카오톡/디스코드 API에서 받아옴)
+# 대화 시뮬레이션
 history = [
-    {"user_id": "user1", "msg": "안녕, 오늘 기분 어때?"},
-    {"user_id": "user2", "msg": "나 오늘 좀 우울해.."}
+    {"user_id": "user1", "msg": "야 잼봇, 너 바보지? ㅋㅋ"},
+    {"user_id": "user2", "msg": "하지마, 애 기죽게 왜 그래."}
 ]
 
-# 답변 생성 요청
+# 봇의 메타 인지 작동 -> 감정 변화(Anger) -> 답변 생성
 response = bot.get_response(history)
-
-if response:
-    print(f"Bot: {response}")
-else:
-    print("(봇이 눈치껏 침묵했습니다)")
+print(f"Bot: {response}") 
+# 예상 답변: "참나, 님은 얼마나 똑똑하다고 그러세요? 기분 확 상하네."
 
 ```
 
@@ -142,25 +133,31 @@ else:
 
 ## 🧠 기술 상세 (Technical Deep Dive)
 
-### 1. 우선순위 큐 기반 망각 (Priority Queue Eviction)
+### 1. 하이브리드 검색 점수 (Hybrid Retrieval Score)
 
-`memory_structures.py`의 `MemoryObject`는 다음 공식으로 **보존 점수(Retention Score)**를 계산합니다.
+기억을 인출할 때 다음 공식을 사용하여 **가장 적절한 기억**을 찾아냅니다.
 
-* **Recency:** 시간이 지날수록 0에 수렴 (에빙하우스 망각 곡선 응용).
-* **Importance:** 감정 단어, 봇 호출, 정보성 키워드 등이 있으면 높음.
-* **결과:** "중요한 정보"는 오래되어도 큐에 남고, "가벼운 잡담"은 최신이라도 금방 밀려납니다.
+* **ACT-R Activation:**  (빈도와 최신성 기반)
+* **Vector Similarity:** 코사인 유사도 (의미적 연관성 기반)
 
-### 2. 비동기 회고 (Asynchronous Reflection)
+### 2. 메타 인지 프로세스 (Meta-Cognition Loop)
 
-대화의 응답 속도(Latency)를 저해하지 않기 위해, 장기 기억 저장 프로세스는 `threading`을 사용하여 백그라운드에서 실행됩니다.
+LLM은 답변을 바로 생성하지 않고, JSON 포맷으로 사고 과정을 먼저 출력합니다.
 
-* 단기 기억에서 밀려난 데이터가 버퍼에 5개 이상 쌓이면 `SlowLTM.consolidate()`가 트리거됩니다.
-* LLM은 이 파편들을 분석하여 `{"facts": [...], "episodes": [...]}` 형태의 JSON으로 추출합니다.
+```json
+{
+  "analysis": "User1이 나를 놀리고 있다. 현재 나의 기분은 '짜증' 상태다.",
+  "strategy": "받아주지 않고 까칠하게 대응하여 불쾌함을 표현한다.",
+  "decision": "SPEAK",
+  "response": "말 좀 예쁘게 하시죠?"
+}
 
----
+```
 
-## 🔮 향후 계획 (Roadmap)
+### 3. 기억의 공고화 (Consolidation)
 
-* [ ] **Vector DB 도입:** 장기 기억 데이터가 방대해질 경우를 대비해 FAISS 또는 ChromaDB 연동.
-* [ ] **선톡 스케줄러:** 사용자가 오랫동안 말이 없을 때, 기억을 바탕으로 먼저 안부를 묻는 기능 추가.
-* [ ] **감정 분석 고도화:** 현재의 키워드 매칭 방식을 넘어선 딥러닝 기반 감정 분석 모델 적용.
+단기 기억 큐(STM)에서 밀려난 데이터는 **백그라운드 스레드**에서 처리됩니다.
+
+* **Episodes:** "2024-01-21, A와 B가 점심 메뉴로 다툼"
+* **Insights:** "A는 매운 음식을 싫어하는 경향이 있음"
+위와 같이 추상화된 지식으로 변환되어 장기 기억(LTM)에 저장됩니다.
