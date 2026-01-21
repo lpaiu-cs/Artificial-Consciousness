@@ -16,7 +16,7 @@ class MemoryObject:
     - importance: 정서적 현저성 (1~10) -> 편도체 역할
     - emotion_tag: 당시의 감정 상태 (OCC 모델 간소화)
     """
-    def __init__(self, content, user_id, role, importance=1.0, emotion="neutral"):
+    def __init__(self, content, user_id, role, importance=1.0, emotion="neutral", embedding=None):
         self.content = content
         self.user_id = str(user_id)
         self.role = role
@@ -27,6 +27,7 @@ class MemoryObject:
         
         self.importance = importance
         self.emotion_tag = emotion
+        self.embedding = embedding
 
     def get_base_activation(self):
         """

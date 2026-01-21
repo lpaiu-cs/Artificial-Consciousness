@@ -1,103 +1,134 @@
+import json
 import threading
-import re
 import requests
 import config
-from memory_structures import CognitiveScorer
+from memory_structures import CognitiveScorer, MemoryObject
 from memory_handler import FastSTM, SlowLTM
+from social_emotion_handler import BotEmotionEngine, SocialMemoryEngine
+from vector_engine import VectorEngine
 
 class LLMHandler:
     def __init__(self):
-        self.scorer = CognitiveScorer() # Attention Module
-        self.stm = FastSTM()            # System 1
-        self.ltm = SlowLTM()            # System 2
-    
+        # 1. 인지 모듈 (감각 & 의미)
+        self.scorer = CognitiveScorer()
+        self.vector_engine = VectorEngine()
+        
+        # 2. 기억 모듈 (System 1 & 2)
+        self.stm = FastSTM(capacity=15) # 단기 기억 용량
+        self.ltm = SlowLTM()            # 장기 기억 관리자
+        
+        # 3. 정서/사회 모듈 (마음 & 관계)
+        self.emotion_engine = BotEmotionEngine()
+        self.social_engine = SocialMemoryEngine()
+
+        self.headers = {
+            "Authorization": f"Bearer {config.LLM_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
     def get_response(self, history, current_query=""):
-        # 1. [Sensory Register] 입력 처리 및 Attention 채점
+        # --- [Step 1: 지각 (Sensory & Encoding)] ---
         if history:
             last = history[-1]
-            # 감정 태그 추출 (임시: 실제론 감정분석 모델 사용 권장)
-            emotion = "neutral"
-            if "ㅠㅠ" in last['msg']: emotion = "sad"
-            
-            importance = self.scorer.calculate_attention(last['msg'], "user")
-            
-            # STM 저장 (ACT-R 활성화 계산 포함)
-            self.stm.add(last['msg'], str(last['user_id']), "user", importance, emotion)
+            uid = str(last.get('user_id'))
+            msg = last.get('msg', '')
+            role = "assistant" if uid == str(config.BOT_USER_ID) else "user"
 
-        # 2. [Retrieval] 기억 인출 (ACT-R Score + Context Relevance)
-        query_keywords = current_query.split() if current_query else []
-        # STM에서 가장 활성화된(관련성+중요도 높은) 기억 인출
-        active_memories = self.stm.retrieve(query_keywords)
+            if role == "user":
+                # 감정/사회성/중요도 업데이트
+                self.emotion_engine.update_mood(msg)
+                self.social_engine.update_affinity(uid, msg)
+                importance = self.scorer.calculate_attention(msg, role)
+                
+                # 임베딩 생성 (유저 메시지만)
+                vector = self.vector_engine.get_embedding(msg)
+                
+                # STM 저장 (여기서 용량 초과 시 Buffer로 밀려남)
+                self.stm.add(msg, uid, role, importance, "neutral", vector)
+
+        # --- [Step 2: 기억 인출 (Hybrid Retrieval)] ---
+        query_vec = self.vector_engine.get_embedding(current_query) if current_query else None
         
-        # 3. [Reconstruction] 기억 재구성 프롬프트 빌딩 (보고서 5.1)
-        # 단기 기억의 흐름(Raw)과 장기 기억의 통찰(Abstract)을 섞어줌
-        stm_context = "\n".join([f"- {m.content} (Emotion: {m.emotion_tag})" for m in active_memories])
-        active_users = list(set([m.user_id for m in active_memories]))
-        ltm_context = self.ltm.get_reconstruction_data(active_users)
+        # 의미(Vector) + 맥락(ACT-R) 하이브리드 검색
+        active_memories = self.stm.retrieve_hybrid(query_vec, self.vector_engine)
+        stm_context = "\n".join([f"- {m.content}" for m in active_memories])
+        
+        # LTM 통찰 및 상태 정보 가져오기
+        target_uid = str(history[-1].get('user_id')) if history else "unknown"
+        ltm_context = self.ltm.get_reconstruction_data([target_uid])
+        mood_desc = self.emotion_engine.get_mood_description()
+        rel_desc = self.social_engine.get_relationship_context(target_uid)
 
+        # --- [Step 3: 메타 인지 (Think & Plan)] ---
         system_prompt = f"""
 {config.BOT_PERSONA}
 
-[Cognitive Workspace: 기억의 재구성]
-너는 단순히 데이터를 검색하는 기계가 아니라, 인간처럼 기억을 '재구성'해야 한다.
-아래 제공된 '단기 기억의 파편'과 '장기 기억의 통찰'을 조합하여, 현재 상황을 해석해라.
+[Internal State]
+- Mood: {mood_desc}
+- Relationship: {rel_desc}
 
-[장기 기억 (통찰 및 과거 에피소드)]
-{ltm_context}
+[Memory Context]
+- Long-term Insights: {ltm_context}
+- Working Memory: {stm_context}
 
-[작업 기억 (현재 대화 흐름 및 활성화된 생각)]
-{stm_context}
-
-[지시사항]
-1. 위 '통찰' 정보를 바탕으로 상대방의 숨겨진 의도나 기분을 파악해라.
-2. 과거의 에피소드와 현재 대화를 연결하여(Association), 자연스럽게 아는 척을 해라.
-3. 할 말이 없거나 끼어들 타이밍이 아니면 `[PASS]` 라고만 말해라.
+[Instruction]
+JSON 포맷으로 사고 과정(Think)과 행동(Act)을 출력해라.
+1. **analysis**: 의도 파악.
+2. **strategy**: 감정과 관계에 따른 태도 결정.
+3. **decision**: "SPEAK" or "PASS" (낄끼빠빠 판단).
+4. **response**: 답변 내용.
 """
-        # 메시지 구성 (최근 3개만 Raw로 넣어서 토큰 절약, 나머지는 Context로 대체)
-        messages = [{"role": "system", "content": system_prompt}]
-        if current_query:
-            messages.append({"role": "user", "content": current_query})
+        
+        final_response = None
 
-        # 3. [Generation] LLM 응답 생성
         try:
             payload = {
                 "model": config.LLM_MODEL,
-                "messages": messages,
-                "temperature": 0.8,
-                "max_tokens": 300
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": current_query or "..."} 
+                ],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.8
             }
-            r = requests.post("https://api.openai.com/v1/chat/completions", headers=self.headers, json=payload, timeout=10)
             
+            r = requests.post("https://api.openai.com/v1/chat/completions", headers=self.headers, json=payload, timeout=15)
             if r.status_code == 200:
-                content = r.json()['choices'][0]['message']['content'].strip()
-                
-                if re.search(r"\[PASS\]", content, re.IGNORECASE):
-                    # 봇이 침묵을 선택해도, 내부적으로 메모리 정리는 수행해야 함
-                    self._check_and_trigger_consolidation()
-                    return None
+                result = json.loads(r.json()['choices'][0]['message']['content'])
+                decision = result.get("decision", "PASS")
+                response_text = result.get("response", "")
 
-                # 4. [Feedback Loop] 봇의 답변도 STM에 저장 (대화 맥락 유지)
-                bot_importance = self.scorer.score(content, "assistant")
-                self.stm.add(content, str(config.BOT_USER_ID), "assistant", bot_importance)
-                
-                # 5. [System 2] 백그라운드 메모리 정리 트리거
-                self._check_and_trigger_consolidation()
-                
-                return content
-            
+                if decision == "SPEAK" and response_text:
+                    final_response = response_text
+                    
+                    # 봇의 발화도 기억에 저장 (맥락 유지)
+                    # 봇의 말은 중요도(2.0)를 주어 STM에 당분간 남게 함
+                    self.stm.add(final_response, config.BOT_USER_ID, "assistant", 2.0)
+                    self.emotion_engine.decay_mood() # 말하고 나면 감정 식힘
+
         except Exception as e:
-            print(f"Error: {e}")
-            return None
+            print(f"Handler Error: {e}")
+
+        # --- [Step 4: 기억 공고화 트리거 (Background Consolidation)] ---
+        # 중요: 봇이 말을 했든(SPEAK) 안 했든(PASS), 
+        # STM 버퍼에 밀려난 기억이 쌓여있으면 정리를 시작해야 함.
+        self._check_and_trigger_consolidation()
+
+        return final_response
 
     def _check_and_trigger_consolidation(self):
         """
-        Buffer에 밀려난 기억이 5개 이상 쌓이면 별도 스레드에서 LTM 저장(Consolidation) 실행.
-        메인 대화 속도에 영향 주지 않음.
+        [System 2 Trigger]
+        단기 기억에서 밀려난(Evicted) 기억들이 버퍼에 5개 이상 쌓이면,
+        별도 스레드에서 LTM(SlowLTM)에게 '성찰 및 저장'을 요청함.
         """
-        # [System 2 Trigger] 버퍼가 차면 성찰(Reflection) 수행
         if len(self.stm.transfer_buffer) >= 5:
+            # 버퍼를 비우고 스냅샷을 뜸 (Thread-safe를 위해 복사)
             buffer_snapshot = self.stm.transfer_buffer[:]
-            self.stm.transfer_buffer = []
-            threading.Thread(target=self.ltm.consolidate_and_reflect, args=(buffer_snapshot,)).start()
-
-        return "LLM Response..."
+            self.stm.transfer_buffer = [] 
+            
+            print(f"🔄 [Background] 기억 정리 시작 ({len(buffer_snapshot)}개 항목)...")
+            
+            # 비동기 실행 (메인 대화 흐름 막지 않음)
+            t = threading.Thread(target=self.ltm.consolidate_and_reflect, args=(buffer_snapshot,))
+            t.start()
