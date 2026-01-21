@@ -1,57 +1,57 @@
 import threading
+import re
 import requests
 import config
-import re
-from memory_structures import ImportanceScorer
+from memory_structures import CognitiveScorer
 from memory_handler import FastSTM, SlowLTM
 
 class LLMHandler:
     def __init__(self):
-        self.scorer = ImportanceScorer(bot_name="잼봇")
-        self.stm = FastSTM(capacity=15) # 단기 기억 용량
-        self.ltm = SlowLTM()            # 장기 기억 관리자
-        
-        self.headers = {
-            "Authorization": f"Bearer {config.LLM_API_KEY}",
-            "Content-Type": "application/json",
-        }
-
-    def get_response(self, history, current_query=None):
-        # 1. [System 1] 입력된 메시지 중요도 채점 및 STM 저장
+        self.scorer = CognitiveScorer() # Attention Module
+        self.stm = FastSTM()            # System 1
+        self.ltm = SlowLTM()            # System 2
+    
+    def get_response(self, history, current_query=""):
+        # 1. [Sensory Register] 입력 처리 및 Attention 채점
         if history:
-            last_msg = history[-1]
-            uid = str(last_msg.get('user_id'))
-            msg = last_msg.get('msg', '')
-            role = "assistant" if uid == str(config.BOT_USER_ID) else "user"
+            last = history[-1]
+            # 감정 태그 추출 (임시: 실제론 감정분석 모델 사용 권장)
+            emotion = "neutral"
+            if "ㅠㅠ" in last['msg']: emotion = "sad"
             
-            # ⚡ NLP 기반 즉시 채점 (LLM 호출 X)
-            importance = self.scorer.score(msg, role)
+            importance = self.scorer.calculate_attention(last['msg'], "user")
             
-            # STM에 저장 (용량 차면 자동으로 Buffer로 밀려남)
-            self.stm.add(msg, uid, role, importance)
+            # STM 저장 (ACT-R 활성화 계산 포함)
+            self.stm.add(last['msg'], str(last['user_id']), "user", importance, emotion)
 
-        # 2. [Context Building] 프롬프트 구성
-        # 2-1. STM에서 살아남은 '중요한 단기 기억' 가져오기
-        active_stm = self.stm.get_working_context()
-        stm_context = "\n".join([f"{m.user_id}: {m.content}" for m in active_stm])
+        # 2. [Retrieval] 기억 인출 (ACT-R Score + Context Relevance)
+        query_keywords = current_query.split() if current_query else []
+        # STM에서 가장 활성화된(관련성+중요도 높은) 기억 인출
+        active_memories = self.stm.retrieve(query_keywords)
         
-        # 2-2. 현재 참여자의 LTM(장기 기억) 가져오기
-        active_users = list(set([m.user_id for m in active_stm if m.role == 'user']))
-        ltm_context = self.ltm.get_context_string(active_users)
+        # 3. [Reconstruction] 기억 재구성 프롬프트 빌딩 (보고서 5.1)
+        # 단기 기억의 흐름(Raw)과 장기 기억의 통찰(Abstract)을 섞어줌
+        stm_context = "\n".join([f"- {m.content} (Emotion: {m.emotion_tag})" for m in active_memories])
+        active_users = list(set([m.user_id for m in active_memories]))
+        ltm_context = self.ltm.get_reconstruction_data(active_users)
 
         system_prompt = f"""
 {config.BOT_PERSONA}
 
-[Long-term Memory: 유저 정보]
+[Cognitive Workspace: 기억의 재구성]
+너는 단순히 데이터를 검색하는 기계가 아니라, 인간처럼 기억을 '재구성'해야 한다.
+아래 제공된 '단기 기억의 파편'과 '장기 기억의 통찰'을 조합하여, 현재 상황을 해석해라.
+
+[장기 기억 (통찰 및 과거 에피소드)]
 {ltm_context}
 
-[Working Memory: 현재 대화 흐름]
-(오래된 잡담은 사라지고 중요한 맥락만 남아있다)
+[작업 기억 (현재 대화 흐름 및 활성화된 생각)]
 {stm_context}
 
-[Instruction]
-1. 위 기억을 바탕으로 자연스럽게 대화해라.
-2. 할 말이 없거나 끼어들 타이밍이 아니면 `[PASS]` 라고만 출력해라.
+[지시사항]
+1. 위 '통찰' 정보를 바탕으로 상대방의 숨겨진 의도나 기분을 파악해라.
+2. 과거의 에피소드와 현재 대화를 연결하여(Association), 자연스럽게 아는 척을 해라.
+3. 할 말이 없거나 끼어들 타이밍이 아니면 `[PASS]` 라고만 말해라.
 """
         # 메시지 구성 (최근 3개만 Raw로 넣어서 토큰 절약, 나머지는 Context로 대체)
         messages = [{"role": "system", "content": system_prompt}]
@@ -94,10 +94,10 @@ class LLMHandler:
         Buffer에 밀려난 기억이 5개 이상 쌓이면 별도 스레드에서 LTM 저장(Consolidation) 실행.
         메인 대화 속도에 영향 주지 않음.
         """
+        # [System 2 Trigger] 버퍼가 차면 성찰(Reflection) 수행
         if len(self.stm.transfer_buffer) >= 5:
-            buffer_snapshot = self.stm.transfer_buffer[:] # 복사
-            self.stm.transfer_buffer = [] # 버퍼 비우기
-            
-            # 비동기 실행
-            t = threading.Thread(target=self.ltm.consolidate, args=(buffer_snapshot,))
-            t.start()
+            buffer_snapshot = self.stm.transfer_buffer[:]
+            self.stm.transfer_buffer = []
+            threading.Thread(target=self.ltm.consolidate_and_reflect, args=(buffer_snapshot,)).start()
+
+        return "LLM Response..."
