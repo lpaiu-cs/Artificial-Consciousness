@@ -36,7 +36,7 @@ CogBot은 단순한 질의응답 시스템이 아닙니다. 인간의 인지 과
 CogBot은 인간의 기억 처리 과정을 공학적으로 모델링했습니다.
 
 ```mermaid
-raph TD
+graph TD
     User[사용자 입력] --> |NLP Scoring| Scorer{중요도 채점}
     Scorer --> |Score & Content| STM["단기 기억 (Priority Queue)"]
     
