@@ -26,35 +26,42 @@ class LLMHandler:
             "Content-Type": "application/json",
         }
 
-    def get_response(self, history, current_query=""):
-        # --- [Step 1: 지각 (Sensory & Encoding)] ---
-        if history:
-            last = history[-1]
-            uid = str(last.get('user_id'))
-            msg = last.get('msg', '')
-            role = "assistant" if uid == str(config.BOT_USER_ID) else "user"
+    def get_response(self, history, current_msg_data=None):
 
-            if role == "user":
-                # 감정/사회성/중요도 업데이트
-                self.emotion_engine.update_mood(msg)
-                self.social_engine.update_affinity(uid, msg)
-                importance = self.scorer.calculate_attention(msg, role)
-                
-                # 임베딩 생성 (유저 메시지만)
-                vector = self.vector_engine.get_embedding(msg)
-                
-                # STM 저장 (여기서 용량 초과 시 Buffer로 밀려남)
-                self.stm.add(msg, uid, role, importance, "neutral", vector)
+        if not current_msg_data:
+            return None
+        
+        # --- [Step 1: 지각 (Sensory & Encoding)] ---
+        uid = str(current_msg_data.get('user_id'))
+        name = current_msg_data.get('user_name', 'Unknown')
+        msg = current_msg_data.get('msg', '')
+        role = "user" if uid != str(config.BOT_USER_ID) else "assistant"
+
+        if role == "user":
+            # 감정/사회성/중요도 업데이트
+            self.emotion_engine.update_mood(msg)
+            self.social_engine.update_affinity(uid, msg)
+            importance = self.scorer.calculate_attention(msg, role)
+            
+            # 임베딩 생성 (유저 메시지만)
+            vector = self.vector_engine.get_embedding(msg)
+            
+            # STM 저장 (여기서 용량 초과 시 Buffer로 밀려남)
+            self.stm.add(msg, uid, role, importance, "neutral", vector)
 
         # --- [Step 2: 기억 인출 (Hybrid Retrieval)] ---
-        query_vec = self.vector_engine.get_embedding(current_query) if current_query else None
+        query_vec = self.vector_engine.get_embedding(msg) if msg else None
         
         # 의미(Vector) + 맥락(ACT-R) 하이브리드 검색
         active_memories = self.stm.retrieve_hybrid(query_vec, self.vector_engine)
         stm_context = "\n".join([f"- {m.content}" for m in active_memories])
         
+
+
+
+        
         # LTM 통찰 및 상태 정보 가져오기
-        target_uid = str(history[-1].get('user_id')) if history else "unknown"
+        target_uid = str(current_msg_data.get('user_id')) if current_msg_data else "unknown"
         ltm_context = self.ltm.get_reconstruction_data([target_uid])
         mood_desc = self.emotion_engine.get_mood_description()
         rel_desc = self.social_engine.get_relationship_context(target_uid)
@@ -86,10 +93,10 @@ JSON 포맷으로 사고 과정(Think)과 행동(Act)을 출력해라.
                 "model": config.LLM_MODEL,
                 "messages": [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": current_query or "..."} 
+                    {"role": "user", "content": msg or "..."} 
                 ],
                 "response_format": {"type": "json_object"},
-                "temperature": 0.8
+                "temperature": 0.8 # 최신 모델에는 온도 조절값이 없음 주의.
             }
             
             r = requests.post("https://api.openai.com/v1/chat/completions", headers=self.headers, json=payload, timeout=15)
@@ -103,7 +110,7 @@ JSON 포맷으로 사고 과정(Think)과 행동(Act)을 출력해라.
                     
                     # 봇의 발화도 기억에 저장 (맥락 유지)
                     # 봇의 말은 중요도(2.0)를 주어 STM에 당분간 남게 함
-                    self.stm.add(final_response, config.BOT_USER_ID, "assistant", 2.0)
+                    self.stm.add(final_response, config.BOT_USER_ID, "assistant", 2.0, "neutral", self.vector_engine.get_embedding(final_response))
                     self.emotion_engine.decay_mood() # 말하고 나면 감정 식힘
 
         except Exception as e:

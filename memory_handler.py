@@ -16,52 +16,76 @@ class FastSTM:
         self.capacity = capacity
         self.memory_queue = [] # Min-Heap (Base Activation 기준 정렬)
         self.transfer_buffer = [] # LTM 전송용 버퍼
+        self.lock = threading.Lock()  # Thread-safety를 위한 Lock
 
-    def add(self, content, user_id, role, importance, emotion="neutral"):
+    def add(self, content, user_id, user_name, role, importance, emotion="neutral", embedding=None):
         # [Attention Filter] 중요도가 너무 낮으면 아예 기억하지 않음 (보고서 2.1.1)
         if importance < NOISE_THRESHOLD:
             return 
 
-        mem = MemoryObject(content, user_id, role, importance, emotion)
-        heapq.heappush(self.memory_queue, mem)
+        mem = MemoryObject(content, user_id, role, importance, emotion, embedding)
+        mem.user_name = user_name  # user_name 속성 추가
         
-        # [Eviction] 용량 초과 시 '활성화 수준'이 가장 낮은 기억 방출
-        if len(self.memory_queue) > self.capacity:
-            evicted = heapq.heappop(self.memory_queue)
+        with self.lock:
+            heapq.heappush(self.memory_queue, mem)
             
-            # 방출된 기억 중 가치 있는 것만 LTM 후보로 (망각 곡선에 따른 자연 소멸)
-            # 중요도 3.0 이상이거나, 최근에 자주 인출되었던 기억은 살림
-            if evicted.importance >= 3.0 or len(evicted.access_history) > 2:
-                self.transfer_buffer.append(evicted)
+            # [Eviction] 용량 초과 시 '활성화 수준'이 가장 낮은 기억 방출
+            if len(self.memory_queue) > self.capacity:
+                evicted = heapq.heappop(self.memory_queue)
+                
+                # 방출된 기억 중 가치 있는 것만 LTM 후보로 (망각 곡선에 따른 자연 소멸)
+                # 중요도 3.0 이상이거나, 최근에 자주 인출되었던 기억은 살림
+                if evicted.importance >= 3.0 or len(evicted.access_history) > 2:
+                    self.transfer_buffer.append(evicted)
 
     def retrieve(self, query_keywords):
         """
         [보고서 6.2] 검색 점수 (Retrieval Score) 계산
         Final Score = (Base Activation) + (Context Relevance)
         """
-        scored_memories = []
-        for mem in self.memory_queue:
-            # 1. 기저 활성화 (ACT-R: 빈도 + 최신성 + 중요도)
-            base_act = mem.get_base_activation()
+        with self.lock:
+            scored_memories = []
+            for mem in self.memory_queue:
+                # 1. 기저 활성화 (ACT-R: 빈도 + 최신성 + 중요도)
+                base_act = mem.get_base_activation()
+                
+                # 2. 문맥 관련성 (Keyword Overlap - 약식 구현)
+                # 실제로는 Vector Embedding Cosine Similarity가 가장 정확함
+                relevance = 0
+                if any(k in mem.content for k in query_keywords):
+                    relevance = 2.0  # 관련성 보너스 (W3)
+                
+                final_score = base_act + relevance
+                scored_memories.append((final_score, mem))
             
-            # 2. 문맥 관련성 (Keyword Overlap - 약식 구현)
-            # 실제로는 Vector Embedding Cosine Similarity가 가장 정확함
-            relevance = 0
-            if any(k in mem.content for k in query_keywords):
-                relevance = 2.0  # 관련성 보너스 (W3)
+            # 점수 높은 순 정렬 (인출)
+            scored_memories.sort(key=lambda x: x[0], reverse=True)
             
-            final_score = base_act + relevance
-            scored_memories.append((final_score, mem))
-        
-        # 점수 높은 순 정렬 (인출)
-        scored_memories.sort(key=lambda x: x[0], reverse=True)
-        
-        # [보고서 2.1.3] 리허설 효과: 인출된 기억은 강화됨
-        retrieved = [m for score, m in scored_memories]
-        for m in retrieved:
-            m.access_history.append(time.time()) # 현재 시간 추가 (활성화 상승)
+            # [보고서 2.1.3] 리허설 효과: 인출된 기억은 강화됨
+            retrieved = [m for score, m in scored_memories]
+            for m in retrieved:
+                m.access_history.append(time.time()) # 현재 시간 추가 (활성화 상승)
+                
+            return retrieved
+
+    def retrieve_hybrid(self, query_vec, vector_engine):
+        """
+        [Hybrid Search] 의미적 유사도 + ACT-R 활성화 기반 인출
+        """
+        with self.lock:
+            scored_memories = []
+            for mem in self.memory_queue:
+                score = vector_engine.calculate_hybrid_score(mem, query_vec)
+                scored_memories.append((score, mem))
             
-        return retrieved
+            scored_memories.sort(key=lambda x: x[0], reverse=True)
+            
+            # 상위 5개만 반환
+            retrieved = [m for score, m in scored_memories[:5]]
+            for m in retrieved:
+                m.access_history.append(time.time())
+                
+            return retrieved
 
 class SlowLTM:
     """
@@ -136,9 +160,17 @@ class SlowLTM:
                     if ep not in existing:
                         self.data[uid]["episodes"].append({"date": "Today", "summary": ep})
         
-        self.save_db()
+        self._save_db()
 
-def get_reconstruction_data(self, user_ids):
+    def _save_db(self):
+        """LTM 데이터를 파일에 저장"""
+        try:
+            with open(self.db_path, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"LTM Save Error: {e}")
+
+    def get_reconstruction_data(self, user_ids):
         """
         [보고서 5.1] 기억 재구성을 위한 Raw Data 제공
         LLM이 이 데이터를 보고 '이야기'를 재구성하도록 함.
