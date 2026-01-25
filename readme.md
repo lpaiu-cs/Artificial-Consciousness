@@ -158,6 +158,103 @@ LTM은 두 가지 층위의 노드로 구성됩니다.
 * STM에서 잊혀진(Evicted) 기억 조각들을 모읍니다.
 * LLM을 사용해 이를 요약하고 통찰을 추출하여 LTM 그래프에 영구 저장(Persistence)합니다.
 
+### 4. CogBot Architecture Diagram
+
+```mermaid
+graph TD
+    %% --- Styling ---
+    classDef ego fill:#f9f,stroke:#333,stroke-width:2px,color:#000;
+    classDef memory fill:#dfd,stroke:#333,stroke-width:1px,color:#000;
+    classDef process fill:#bbf,stroke:#333,stroke-width:1px,color:#000;
+    classDef external fill:#eee,stroke:#333,stroke-width:1px,stroke-dasharray: 5 5,color:#000;
+    classDef database fill:#ffd,stroke:#333,stroke-width:2px,color:#000;
+
+    %% --- External Entities ---
+    User([👤 User Input]):::external
+    API_Groq{{⚡ Groq API<br/>System 1: Fast}}:::external
+    API_OpenAI{{🧠 OpenAI API<br/>System 2: Slow and Embedding}}:::external
+
+    %% --- Main System ---
+    subgraph "🤖 CogBot (The Ego)"
+        BO["Bot Orchestrator<br/>Central Controller"]:::ego
+        
+        subgraph "Perception and Action"
+            Sensory["Sensory System<br/>Chunking"]:::process
+            Social["Social Map<br/>Relationship Context"]:::database
+        end
+        
+        subgraph "Memory Systems (Cognitive Core)"
+            STM["Working Memory (STM)<br/>Priority Queue and Activation"]:::memory
+            LTM_Handler["LTM Handler<br/>Anchor and Spread Retrieval"]:::memory
+            LTM_Graph[("Memory Graph DB<br/>Episode and Insight Nodes")]:::database
+        end
+        
+        subgraph "External Interface"
+            UnifiedAPI["Unified API Client"]:::process
+        end
+    end
+
+    %% --- Background Process ---
+    subgraph "Background Process (Async)"
+        Reflection["Reflection Handler<br/>Consolidation and Insight Extraction"]:::process
+    end
+
+    %% --- Main Flow ---
+    User -->|"1. Trigger"| BO
+
+    %% 2. Perception and STM Injection
+    BO -->|"2. Raw Logs"| Sensory
+    Sensory -->|"chunks"| BO
+    BO -->|"3. Inject and Scoring"| STM
+
+    %% 3. Retrieval Loop
+    BO -->|"4. Query Context"| LTM_Handler
+    LTM_Handler -->|"Get Embedding"| UnifiedAPI
+    LTM_Handler <-->|"5. Search and Traverse"| LTM_Graph
+    LTM_Handler -->|"6. Retrieved Nodes"| BO
+    
+    %% 4. Attention (Scoring Update)
+    BO -->|"7. Boost/Decay Activations"| STM
+
+    %% 5. Cognition (Dual Process)
+    BO -->|"Context Info"| Social
+    
+    BO -->|"8. Fast Summary Request"| UnifiedAPI
+    UnifiedAPI -.-> API_Groq
+    API_Groq -.-> UnifiedAPI
+    
+    BO -->|"9. Slow Generation Request"| UnifiedAPI
+    UnifiedAPI -.-> API_OpenAI
+    API_OpenAI -.-> UnifiedAPI
+
+    BO -->|"10. Final Response"| User
+
+    %% --- Background Flows ---
+    STM -.->|"Evicted Memories (Buffer)"| Reflection
+    Reflection -.->|"Analyze and Summarize"| UnifiedAPI
+    Reflection -->|"11. Persist and Connect"| LTM_Graph
+```
+
+---
+
+### 🖼️ 다이어그램 설명
+
+이 다이어그램은 CogBot의 데이터 흐름과 핵심 컴포넌트 간의 관계를 보여줍니다.
+
+1. **중앙 제어 (The Ego):** `Bot Orchestrator`가 모든 인지 과정의 중심에서 입력을 받고, 기억을 조회하며, 최종 행동(답변)을 결정합니다.
+2. **이중 처리 (Dual Process):**
+* **System 1 (Fast):** Groq API를 통해 빠른 맥락 요약과 직관적인 처리를 수행합니다.
+* **System 2 (Slow):** OpenAI API를 통해 깊은 사고, 감정 분석, 그리고 기억의 성찰(Reflection)을 수행합니다.
+
+
+3. **메모리 순환 (Memory Cycle):**
+* 입력된 정보는 `STM`(작업 기억)에서 활성화됩니다.
+* `LTM Handler`가 `Memory Graph`에서 관련된 장기 기억을 인출(Retrieval)합니다.
+* STM에서 중요도가 떨어진 기억은 방출(Eviction)되어 `Reflection Handler`로 전달됩니다.
+
+
+4. **비동기 성찰 (Async Reflection):** 백그라운드에서 작동하는 `Reflection Handler`가 방출된 기억을 분석하여 통찰(Insight)을 추출하고, 이를 다시 `Memory Graph`에 영구적으로 저장하며 지식을 확장합니다.
+
 ---
 
 ## 🔮 Future Roadmap
