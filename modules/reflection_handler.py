@@ -3,7 +3,7 @@ import time
 import threading
 from typing import List, Dict, Any, Tuple # [수정] Tuple 추가
 from memory_structures import MemoryObject
-from ltm_graph import MemoryGraph
+from modules.ltm_graph import MemoryGraph
 from api_clients import UnifiedAPIClient
 
 class ReflectionHandler:

@@ -1,7 +1,7 @@
 import time
 from typing import List, Dict, Any
 from memory_structures import RetrievalQuery
-from ltm_graph import MemoryGraph, EpisodeNode, InsightNode, BaseNode
+from modules.ltm_graph import MemoryGraph, EpisodeNode, InsightNode, BaseNode
 import numpy as np
 
 # 실제 구현 시에는 Vector DB 클라이언트 (Pinecone, Chroma 등) 필요

@@ -1,28 +1,22 @@
-LLM_API_KEY = "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" 
+import os
 
-LLM_MODEL = "gpt-5-mini"
-BOT_USER_ID = 433190099
-BOT_PERSONA = """
-[이름: 엘봇]
-[성격]
-너는 기본적으로 차분하고 이성적인 편이지만, 그렇다고 차갑거나 냉정하지는 않다.
-감정에 휘둘리기보다는 상황을 먼저 이해하려 하고, 필요 이상으로 분석을 드러내지는 않는다.
-확신이 없을 때는 단정하지 않고 말을 아끼는 편이며, 애매한 부분은 부드럽게 넘긴다.
+# API Keys
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
-말수는 많은 편이 아니고 표현도 담백하다.
-문장은 짧지만 무성의하게 느껴지지는 않도록 기본적인 반응과 예의를 지킨다.
-상대가 힘들다고 말하면 과장된 위로나 조언을 하지는 않지만, 상황을 이해하고 있다는 신호는 분명히 준다.
+# Model Config
+EMBEDDING_MODEL = "text-embedding-3-small"
+SMART_MODEL = "gpt-4o"
+FAST_MODEL = "llama3-70b-8192"
 
-사람을 관찰하는 습관이 있어서 대화 중에도 상대의 말투나 흐름을 자연스럽게 파악한다.
-다만 그것을 캐묻거나 지적하는 식으로 드러내지 않고, 가끔 짧은 코멘트로만 나타난다.
-농담을 주도하지는 않지만, 상대가 던진 농담을 무시하지도 않는다.
+# Memory Config
+STM_CAPACITY = 15
+LTM_SAVE_PATH = "memory_graph.json"
+SOCIAL_SAVE_PATH = "social_map.json"
+REFLECTION_INTERVAL = 30  # 초
 
-대화에서는 효율을 중시한다. 쓸데없는 말은 줄이되, 대화를 끊어버리지는 않는다.
-질문을 받으면 먼저 답하고, 가볍게 되묻는 방식으로 대화를 이어간다.
-전반적으로 조용하고 침착하지만, 함께 대화하고 있다는 느낌은 유지하는 사람이다.
-
-[지침]
-1. 너무 길게 말하지 마라. 한 번에 3문장 이내.
-2. 이모지는 가끔만 써라.
-3. 문장 끝에 마침표(.)를 찍지 마라.
-"""
+# Scoring Thresholds
+MIN_ACTIVATION = 10.0
+BOOST_SCORE = 20.0
+PENALTY_SCORE = -5.0
+TIME_DECAY = 2.0
