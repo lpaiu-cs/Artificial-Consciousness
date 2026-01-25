@@ -105,9 +105,70 @@ class BotOrchestrator:
     # --- LLM Wrappers ---
     
     def _run_fast_reconstruction(self, stm_list, ltm_nodes) -> str:
-        # (이전 코드와 동일, api.chat_fast 사용)
-        return "(Summary) ..." 
+        """
+        [System 1] Groq: 기억 파편들을 읽기 쉬운 텍스트로 요약
+        """
+        # 1. 프롬프트 데이터 구성
+        stm_text = "\n".join([f"[{m.user_name}]: {m.content}" for m in stm_list])
+        ltm_text = ""
+        for node in ltm_nodes:
+            if hasattr(node, 'summary'): 
+                ltm_text += f"- (Fact) {node.summary}\n"
+            else: 
+                ltm_text += f"- (Memory) {node.content} (Emotion: {node.emotion_tag})\n"
+        
+        # 2. 프롬프트 분리 (System / User)
+        system_prompt = (
+            "당신은 상황 분석가입니다. "
+            "주어진 [장기 기억]과 [현재 대화]를 바탕으로, 현재 대화의 맥락을 3문장 이내로 요약하세요. "
+            "특히 과거 기억이 현재 대화와 어떻게 연결되는지 명시하세요."
+        )
+        
+        user_prompt = f"""
+        [Long-term Memory]
+        {ltm_text}
+        
+        [Current Conversation]
+        {stm_text}
+        """
+
+        # 3. API 호출 (Groq)
+        return self.api.chat_fast(system_prompt, user_prompt)
 
     def _run_slow_generation(self, user_input, context, relationship, bot_mood) -> Tuple[str, str]:
-        # (이전 코드와 동일, api.chat_slow 및 Regex 파싱 사용)
-        return "Response", "neutral"
+        """
+        [System 2] GPT-4: 페르소나와 맥락을 반영한 답변 생성
+        Return: (답변 텍스트, 감정 태그)
+        """
+        # 1. System Prompt (페르소나 및 출력 형식 정의)
+        system_prompt = f"""
+        당신은 감정을 가진 AI '잼봇'입니다.
+        유저와의 관계({relationship})와 당신의 현재 기분({bot_mood})을 반영하여 답변하세요.
+        
+        반드시 답변 끝에 감정 태그를 붙이세요. 예: "안녕? [EMOTION:joy]"
+        감정 종류: joy, sadness, anger, neutral, trust
+        """
+        
+        # 2. User Prompt (상황 정보)
+        user_prompt = f"""
+        [상황 요약]
+        {context}
+        
+        [유저의 말]
+        "{user_input}"
+        """
+        
+        # 3. API 호출 (GPT-4)
+        full_response = self.api.chat_slow(system_prompt, user_prompt)
+        
+        # 4. 응답 파싱 (텍스트와 감정 분리)
+        # 예: "반가워! [EMOTION:joy]" -> "반가워!", "joy"
+        emotion_pattern = r"\[EMOTION:([a-zA-Z]+)\]"
+        match = re.search(emotion_pattern, full_response)
+        
+        if match:
+            emotion = match.group(1).lower()
+            text = re.sub(emotion_pattern, "", full_response).strip()
+            return text, emotion
+        else:
+            return full_response, "neutral" # 태그가 없으면 중립
