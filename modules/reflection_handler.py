@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Tuple # [수정] Tuple 추가
 from memory_structures import MemoryObject
 from modules.ltm_graph import MemoryGraph
 from api_clients import UnifiedAPIClient
+import config
 
 class ReflectionHandler:
     """
@@ -13,11 +14,17 @@ class ReflectionHandler:
     1. 하나의 에피소드(Episode)로 요약하고
     2. 그 안에서 통찰(Insight)을 추출하여
     3. Memory Graph에 저장하고 연결(Wiring)합니다.
+    
+    Thread Safety:
+    - MemoryGraph는 내부적으로 Lock을 사용하므로 
+      이 핸들러에서는 별도의 Lock 없이 그래프 메서드 호출
+    - STM 버퍼 접근 시에는 스냅샷 복사 후 처리
     """
     def __init__(self, ltm_graph: MemoryGraph, api_client: UnifiedAPIClient):
         self.graph = ltm_graph
         self.api = api_client
         self.is_running = False
+        self._buffer_lock = threading.Lock()  # STM 버퍼 접근용 Lock
         
     def start_background_loop(self, stm_buffer: List[MemoryObject], interval=60):
         """백그라운드에서 주기적으로 Reflection 수행"""
@@ -26,20 +33,28 @@ class ReflectionHandler:
         thread.daemon = True
         thread.start()
 
+    def stop(self):
+        """백그라운드 루프 중지"""
+        self.is_running = False
+
     def _loop(self, stm_buffer, interval):
         while self.is_running:
             time.sleep(interval)
-            # 버퍼에 데이터가 쌓였는지 확인 (Lock 처리가 이상적이나, 리스트 atomic 연산 의존)
-            if len(stm_buffer) >= 3: 
+            # Thread-Safe: Lock으로 버퍼 길이 확인
+            with self._buffer_lock:
+                buffer_size = len(stm_buffer)
+            
+            if buffer_size >= 3: 
                 self.process_buffer(stm_buffer)
 
     def process_buffer(self, buffer: List[MemoryObject]):
-        """버퍼의 내용을 가져와 LTM에 저장"""
-        # 1. 데이터 스냅샷 & 버퍼 비우기 (Thread-safe)
-        if not buffer: return
-        
-        chunk = buffer[:]
-        buffer.clear() # 원본 리스트 비우기
+        """버퍼의 내용을 가져와 LTM에 저장 (Thread-Safe)"""
+        # 1. 데이터 스냅샷 & 버퍼 비우기 (Thread-Safe)
+        with self._buffer_lock:
+            if not buffer: 
+                return
+            chunk = buffer[:]
+            buffer.clear()  # 원본 리스트 비우기
         
         print(f"💤 [Reflection] 기억 정리 및 저장 시작... ({len(chunk)} items)")
         
@@ -51,10 +66,11 @@ class ReflectionHandler:
             return
 
         # 3. 그래프에 저장 (Graph Update) + 임베딩 생성
+        # MemoryGraph는 내부적으로 Lock 사용하므로 안전
         self._apply_to_graph(analysis_result)
 
-        # 4. [중요] 영속성 저장 (파일 쓰기)
-        self.graph.save_to_json()
+        # 4. [중요] 영속성 저장 (파일 쓰기) - Thread-Safe
+        self.graph.save_all()
 
     def _analyze_with_llm(self, memories: List[MemoryObject]) -> Dict[str, Any]:
         """LLM: Raw Logs -> Structured Memory (Episode & Insights)"""
@@ -128,9 +144,15 @@ class ReflectionHandler:
                 embedding=ins_embedding
             )
             
-            # [Evidence Edge] 연결
-            # 통찰 <-> 에피소드 (가중치는 로직에 따라 조절 가능)
-            self.graph.connect_nodes(ins_node.node_id, ep_node.node_id, weight=0.8)
-            self.graph.connect_nodes(ep_node.node_id, ins_node.node_id, weight=1.0)
+            # [Evidence Edge] 연결 - config에서 가중치 사용
+            # 통찰 <-> 에피소드
+            self.graph.connect_nodes(
+                ins_node.node_id, ep_node.node_id, 
+                weight=config.EVIDENCE_EDGE_TO_EPISODE
+            )
+            self.graph.connect_nodes(
+                ep_node.node_id, ins_node.node_id, 
+                weight=config.EVIDENCE_EDGE_TO_INSIGHT
+            )
             
         print(f"✅ [Reflection] 저장 완료: Episode({ep_node.node_id[:8]}) + {len(insights)} Insights saved.")

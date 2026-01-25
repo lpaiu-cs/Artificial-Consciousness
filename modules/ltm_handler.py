@@ -3,6 +3,7 @@ from typing import List, Dict, Any
 from memory_structures import RetrievalQuery
 from modules.ltm_graph import MemoryGraph, EpisodeNode, InsightNode, BaseNode
 import numpy as np
+import config
 
 # 실제 구현 시에는 Vector DB 클라이언트 (Pinecone, Chroma 등) 필요
 # 여기서는 MockVectorDB로 대체합니다.
@@ -32,9 +33,8 @@ class LongTermMemory:
         # 질문의 의도(Embedding)와 가장 유사한 '통찰(Insight)'과 '사건(Episode)'을 찾습니다.
         # Insight에 가중치를 두어 검색합니다. (지식 우선 검색)
         
-        # [Mockup] 실제로는 vector_db.query(query.embedding) 호출
-        # 여기서는 그래프 내 모든 노드를 뒤져서 코사인 유사도 계산한다고 가정
-        all_nodes = list(self.graph.episodes.values()) + list(self.graph.insights.values())
+        # [Thread-Safe] 그래프에서 스냅샷 가져오기
+        all_nodes = self.graph.get_all_nodes()
         anchors = self._mock_vector_search(all_nodes, query.embedding, top_k=top_k * 2)
 
         for node, sim_score in anchors:
@@ -42,8 +42,9 @@ class LongTermMemory:
             if isinstance(node, EpisodeNode) and node.user_id != query.user_id:
                 continue
             
-            # Insight는 검색 점수 보너스 (Fact 우선)
-            base_score = sim_score * (1.2 if isinstance(node, InsightNode) else 1.0)
+            # Insight는 검색 점수 보너스 (Fact 우선) - config에서 가중치 사용
+            insight_weight = config.INSIGHT_BONUS if isinstance(node, InsightNode) else config.EPISODE_BASE_WEIGHT
+            base_score = sim_score * insight_weight
             
             candidates[node.node_id] = {
                 "node": node, 
@@ -73,17 +74,17 @@ class LongTermMemory:
                 if not target_node: continue
 
                 # 확산 점수 계산: (부모 점수) * (연결 강도) * (감쇠 계수)
-                spread_score = anchor_score * edge_weight * 0.8
+                spread_score = anchor_score * edge_weight * config.SPREAD_DECAY_FACTOR
                 
-                # [Logic] 노드 타입별 확산 전략
+                # [Logic] 노드 타입별 확산 전략 - config에서 가중치 사용
                 if isinstance(anchor_node, InsightNode) and isinstance(target_node, EpisodeNode):
                     # Insight -> Episode: "이 생각의 근거가 되는 사건" (중요)
-                    spread_score *= 1.1 
+                    spread_score *= config.INSIGHT_TO_EPISODE_BOOST
                     reason = f"evidence_of_insight({anchor_node.summary[:10]}..)"
                     
                 elif isinstance(anchor_node, EpisodeNode) and isinstance(target_node, EpisodeNode):
                     # Episode -> Episode: "그때 있었던 앞뒤 상황" (시간적/의미적 맥락)
-                    spread_score *= 0.9 # 너무 멀리 가지 않게
+                    spread_score *= config.EPISODE_TO_EPISODE_DECAY
                     reason = "temporal_context"
                 else:
                     reason = "graph_connection"
@@ -106,24 +107,24 @@ class LongTermMemory:
             # 1. [Similarity] 벡터 유사도로 시작
             final_score = data["score"]
             
-            # 2. [Importance/Mood] 기분 일치성
+            # 2. [Importance/Mood] 기분 일치성 - config에서 가중치 사용
             # 현재 봇의 기분과 기억의 감정이 일치하면 가산점
             if isinstance(node, EpisodeNode):
                 if node.emotion_tag == query.current_mood:
-                    final_score *= 1.2 # 기분에 맞는 기억 증폭
+                    final_score *= config.MOOD_CONGRUENCE_BOOST
             
-            # 3. [Recency] Time Decay - 오래된 기억은 감가상각
+            # 3. [Recency] Time Decay - 오래된 기억은 감가상각 - config에서 감쇠율 사용
             if isinstance(node, EpisodeNode):
                 hours_passed = (time.time() - node.timestamp) / 3600
-                decay = 1.0 / (1.0 + (hours_passed / 24.0 * 0.05)) # 완만한 감소
+                decay = 1.0 / (1.0 + (hours_passed / 24.0 * config.RECENCY_DECAY_RATE))
                 final_score *= decay
 
-            # 4. [Keyword Matching] Hybrid Search
+            # 4. [Keyword Matching] Hybrid Search - config에서 부스트 사용
             # 임베딩이 놓친 고유명사(예: "민초")가 텍스트에 있으면 점수 팍 올림
             node_text = node.content if isinstance(node, EpisodeNode) else node.summary
             for kw in query.keywords:
                 if kw in node_text:
-                    final_score *= 1.5
+                    final_score *= config.KEYWORD_MATCH_BOOST
                     break
             
             # 5. [Frequency]는 그래프 구조 자체에서 해결됨

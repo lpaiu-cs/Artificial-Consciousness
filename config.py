@@ -15,8 +15,33 @@ LTM_SAVE_PATH = "memory_graph.json"
 SOCIAL_SAVE_PATH = "social_map.json"
 REFLECTION_INTERVAL = 30  # 초
 
-# Scoring Thresholds
+# Scoring Thresholds (STM)
 MIN_ACTIVATION = 10.0
 BOOST_SCORE = 20.0
 PENALTY_SCORE = -5.0
 TIME_DECAY = 2.0
+
+# === LTM Retrieval Weights ===
+# Phase 1: Anchoring (Vector Search)
+INSIGHT_BONUS = 1.2          # Insight 노드 검색 시 보너스 가중치
+EPISODE_BASE_WEIGHT = 1.0    # Episode 노드 기본 가중치
+
+# Phase 2: Spreading (Graph Traversal)
+SPREAD_DECAY_FACTOR = 0.8    # 그래프 확산 시 감쇠 계수
+INSIGHT_TO_EPISODE_BOOST = 1.1  # Insight -> Episode 확산 보너스
+EPISODE_TO_EPISODE_DECAY = 0.9  # Episode -> Episode 확산 감쇠
+
+# Phase 3: Reranking & Contextual Adjustment
+MOOD_CONGRUENCE_BOOST = 1.2  # 기분 일치 시 점수 증폭
+RECENCY_DECAY_RATE = 0.05    # 시간 경과에 따른 감쇠율 (per 24h)
+KEYWORD_MATCH_BOOST = 1.5    # 키워드 매칭 시 점수 증폭
+
+# === Graph Edge Weights ===
+TEMPORAL_EDGE_FORWARD = 0.5   # Episode -> 다음 Episode 연결 강도
+TEMPORAL_EDGE_BACKWARD = 1.0  # Episode <- 이전 Episode 연결 강도 (역방향)
+EVIDENCE_EDGE_TO_EPISODE = 0.8   # Insight -> Episode 연결 강도
+EVIDENCE_EDGE_TO_INSIGHT = 1.0   # Episode -> Insight 연결 강도
+
+# === Storage Paths ===
+LTM_GRAPH_PATH = "ltm_graph.json"       # 그래프 구조 (노드 메타데이터 + 엣지)
+LTM_EMBEDDINGS_PATH = "ltm_embeddings.json"  # 임베딩 벡터 저장소
