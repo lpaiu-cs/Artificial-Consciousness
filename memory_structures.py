@@ -42,7 +42,7 @@ class BaseNode:
 class EpisodeNode(BaseNode):
     content: str = ""
     timestamp: float = 0.0
-    emotion_tag: str = "neutral"
+    emotion_tag: str = "calm"
     user_id: str = "unknown"
     type: str = "episode"
 

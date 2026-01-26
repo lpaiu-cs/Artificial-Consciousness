@@ -1,6 +1,7 @@
 from typing import List, Dict
 import time
 from memory_structures import MemoryObject
+from api_clients import UnifiedAPIClient
 
 class SensorySystem:
     """
@@ -8,9 +9,10 @@ class SensorySystem:
     Raw 채팅 로그를 받아 '화자(Speaker)' 단위로 메시지를 병합(Chunking)합니다.
     짧게 끊어 친 카톡 스타일의 대화를 완성된 문장 형태로 STM에 전달합니다.
 
-    TODO: 청크 관련 로직 고도화
+    TODO: 청킹 관련 로직 고도화
     """
-    def __init__(self, time_threshold: float = 30.0):
+    def __init__(self, api_client: UnifiedAPIClient, time_threshold: float = 30.0):
+        self.api = api_client
         # 30초 이내의 연속 발화는 같은 맥락으로 간주
         self.time_threshold = time_threshold
 
@@ -60,6 +62,9 @@ class SensorySystem:
         # 마지막 청크 저장
         self._commit_chunk(chunked_memories, current_chunk)
         
+        # 임베딩 추가
+        chunked_memories = self._enrich_chunks_with_embedding(chunked_memories)
+        
         return chunked_memories
 
     def _commit_chunk(self, storage, chunk_data):
@@ -75,3 +80,11 @@ class SensorySystem:
                 activation=50.0 # 초기 활성화 점수 (신규 기억은 생생함)
             )
             storage.append(mem)
+
+    def _enrich_chunks_with_embedding(self, chunks: List[MemoryObject]) -> List[MemoryObject]:
+        """각 청크의 텍스트를 벡터로 변환"""
+        for chunk in chunks:
+            # API를 통해 임베딩 생성 (비용이 걱정되면 생략하거나 비동기 처리 가능)
+            # 하지만 STM 용량(15개)이 작으므로 실시간 처리에 무리 없음
+            chunk.embedding = self.api.get_embedding(chunk.content)
+        return chunks

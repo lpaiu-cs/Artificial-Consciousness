@@ -74,10 +74,9 @@ class ReflectionHandler:
 
     def _analyze_with_llm(self, memories: List[MemoryObject]) -> Dict[str, Any]:
         """LLM: Raw Logs -> Structured Memory (Episode & Insights)"""
-        
-        logs_text = "\n".join([f"[{m.role}] {m.content}" for m in memories])
+        logs_text = "\n".join([f"[{m.role}] {m.content} (Feel: {m.emotion_tag})" for m in memories])
         # 대표 유저 ID 추출 (가장 빈번하게 등장한 ID를 쓰는 것이 좋으나 여기선 첫번째 사용)
-        user_id = memories[0].user_id 
+        user_id = memories[0].user_id
 
         system_prompt = (
             "당신은 AI의 기억 관리자(Memory Manager)입니다. "
@@ -88,21 +87,11 @@ class ReflectionHandler:
         [대화 로그]
         {logs_text}
 
-        위 대화를 분석하여 다음 JSON 형식으로 출력하세요:
+        Analyze the conversation and output JSON:
         1. episode_summary: 대화 전체를 "누가, 언제, 무엇을 했다" 형태로 1문장 요약.
-        2. dominant_emotion: 이 대화의 지배적인 감정 (joy, sadness, anger, neutral, trust 중 택1).
+        2. dominant_feeling: Select the most representative 'feeling' tag found in the logs (or a combined nuance). Keep it under 10 chars. (e.g. "어이없음", "따뜻한 위로")
         3. insights: 대화에서 발견된 유저에 대한 불변의 사실(Fact)이나 성향 리스트.
-           (형식: subject(주어), predicate(술어), object(목적어), summary(설명))
-
-        [Output Example]
-        {{
-            "episode_summary": "유저가 비 오는 날씨를 보고 과거 파전 먹던 추억을 이야기함.",
-            "dominant_emotion": "joy",
-            "insights": [
-                {{"subject": "User", "predicate": "likes", "object": "Rainy days", "summary": "유저는 비 오는 날의 분위기를 좋아함"}}
-            ],
-            "user_id": "{user_id}" 
-        }}
+           형식: list of {{subject, predicate, object, summary}}.
         """
 
         # API Client의 chat_slow (GPT-4) 호출, json_mode=True 사용
