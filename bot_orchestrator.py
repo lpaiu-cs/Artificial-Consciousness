@@ -7,7 +7,7 @@ import config
 from memory_structures import RetrievalQuery, MemoryObject
 
 # Modules
-from api_clients import UnifiedAPIClient
+from api_client import UnifiedAPIClient
 from modules.sensory_system import SensorySystem
 from modules.stm_handler import WorkingMemory
 from modules.ltm_graph import MemoryGraph
@@ -17,8 +17,10 @@ from modules.social_module import SocialMap
 
 '''
 TODO:
-감정 상태 저장에 대한 로직 변경. (현재 의도대로 안되어있음)
-
+구조 리팩토링 -> 네이밍과 모듈에 함수 재배치 정리.
+user_id(고윳값)과 nickname(변수) 매핑 시스템 구축.
+기 저장된 nodes에 대해 내용 수정 기능 추가.
+기억(node) 연결과 갱신에 대한 로직 강화.
 
 after work:
 엔트리포인트 설정해야함.
@@ -51,8 +53,10 @@ class BotOrchestrator:
         """
         user_id = str(calling_message.get("user_id"))
 
-        # II. Perception (2, 3)
+        # II. Perception (2)
         chunked_memories = self._perceive(history, calling_message)
+        # Inject into Working Memory (STM) (3)
+        self.stm.inject_memories(chunked_memories)
         
         # III. Retrieval & Attention (4, 5, 6, 7) - 수정점. 5 이름이 Search and Traverse인데, Attention이 빠졌고, 5와 6의 경계가 불분명.
         query_text = chunked_memories[-1].content
@@ -63,19 +67,40 @@ class BotOrchestrator:
         rel_desc = self.social.get_relationship_desc(user_id)
         
         # V. Action (9)
-        response = self._act(query_text, context_summary, rel_desc)
+        response = self._act(user_id, query_text, context_summary, rel_desc)
         
         return response
 
     # --- Private Pipelines ---
 
-    def _perceive(self, history, calling_message) -> List[MemoryObject]:
-        # Sensory System (Chunking)
-        chunks = self.sensory.process_input(history, calling_message)
-        # Inject into Working Memory (STM)
-        self.stm.inject_memories(chunks)
-        return chunks
+    # Sensory System (Chunking)
+    def _perceive(self, history, current_msg) -> List[MemoryObject]:
+        # 1. 청킹 및 임베딩 (기존 로직)
+        chunks = self.sensory.process_input(history, current_msg)
+        
+        # 2. [New] 정체성 확인 (Identity Check)
+        user_id = str(current_msg.get("user_id"))
+        nickname = current_msg.get("user_name", "Unknown")
+        
+        is_changed = self.social.update_identity(user_id, nickname)
+        
+        if is_changed:
+            # 닉네임 변경 사실을 STM에 강제 주입!
+            # 봇이 "어? 닉네임 바꿨네?"라고 인식하게 만듦
+            old_name = self.social.social_data[user_id]["history"][-1]
+            change_event = MemoryObject(
+                content=f"시스템 알림: 유저({user_id})가 닉네임을 '{old_name}'에서 '{nickname}'(으)로 변경했습니다.",
+                role="system",
+                user_id=user_id,
+                user_name="System",
+                activation=100.0 # 매우 중요함
+            )
+            # 임베딩 생성 후 주입
+            change_event.embedding = self.api.get_embedding(change_event.content)
+            chunks.append(change_event)
 
+        return chunks
+    
     def _retrieve_and_attend(self, query_text: str, user_id: str):
         # Create Query
         query_embedding = self.api.get_embedding(query_text)
@@ -204,11 +229,11 @@ class BotOrchestrator:
         유저와의 관계({relationship})와 현재 당신의 기분("{bot_mood}")을 반영하여 답변하세요.
         
         [출력 규칙]
-        답변 끝에 당신이 느끼는 **구체적인 감정**을 [FEELING:감정단어] 형태로 붙이세요.
-        - 감정 단어는 10자 이내의 자연어로 자유롭게 표현하세요. (예: "묘한 설렘", "차가운 분노", "귀찮음", "안도감")
-        - 카테고리로 분류하지 말고, **뉘앙스**를 살리세요.
+        답변 끝에 당신이 느끼는 **구체적인 감정**을 [FEELING:감정어] 형태로 붙이세요.
+        - 감정어는 10자 이내의 자연어로 자유롭게 표현하세요. (예: "묘한 설렘", "차가운 분노", "귀찮음", "안도감")
+        - 이때, 카테고리로 분류가 아닌, **뉘앙스**를 살리세요.
         
-        예시 Output: "아 진짜? 그건 좀 너무했다. [FEELING:어이없음]"
+        Example Output: "아 진짜? 그건 좀 너무했다. [FEELING:어이없음]"
         """
         
         user_prompt = f"""

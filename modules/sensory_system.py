@@ -1,7 +1,7 @@
 from typing import List, Dict
 import time
 from memory_structures import MemoryObject
-from api_clients import UnifiedAPIClient
+from api_client import UnifiedAPIClient
 
 class SensorySystem:
     """
