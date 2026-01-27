@@ -17,10 +17,10 @@ from modules.social_module import SocialManager
 
 '''
 TODO:
-구조 리팩토링 -> 네이밍과 모듈에 함수 재배치 정리.
-user_id(고윳값)과 nickname(변수) 매핑 시스템 구축.
-기 저장된 nodes에 대해 내용 수정 기능 추가.
-기억(node) 연결과 갱신에 대한 로직 강화.
+구조 리팩토링 -> 네이밍과 모듈에 함수 재배치 정리. (done.)
+user_id(고윳값)과 nickname(변수) 매핑 시스템 구축. (done?)
+기 저장된 nodes에 대해 내용 수정 기능 추가. (done?)
+기억(node) 연결과 갱신에 대한 로직 강화. (done?)
 
 after work:
 엔트리포인트 설정해야함.
