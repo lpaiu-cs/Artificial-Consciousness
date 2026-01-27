@@ -57,6 +57,9 @@ POSITIVE_EMOTION_ANCHOR = "joyful trust and happiness"
 # 호감도 변화 스케일링 (유사도 1.0일 때 최대 몇 점 변할지)
 SOCIAL_SENSITIVITY = 5.0
 
+# 봇 자아
+BOT_NAME = "코봇"
+
 # === API Logging Config ===
 API_LOGGING_ENABLED = True          # API 로깅 on/off (테스트 시 False로 설정)
 API_LOG_FILE = "api_logs.jsonl"     # 로그 파일 경로

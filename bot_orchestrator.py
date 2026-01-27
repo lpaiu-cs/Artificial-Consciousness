@@ -18,7 +18,7 @@ from modules.social_module import SocialManager
 '''
 TODO:
 구조 리팩토링 -> 네이밍과 모듈에 함수 재배치 정리. (done.)
-user_id(고윳값)과 nickname(변수) 매핑 시스템 구축. (done?)
+user_id(고윳값)과 nickname(변수) 매핑 시스템 구축. (done?~)
 기 저장된 nodes에 대해 내용 수정 기능 추가. (done?)
 기억(node) 연결과 갱신에 대한 로직 강화. (done?)
 
@@ -34,7 +34,6 @@ class BotOrchestrator:
     """
     [The Ego: Central Controller]
     인지 과정(Perception -> Retrieval -> Cognition -> Action)을 조율합니다.
-    복잡한 세부 로직은 각 모듈로 위임하고, '의사결정'과 '데이터 흐름'만 관리합니다.
     """
     
     def __init__(self):
@@ -56,6 +55,8 @@ class BotOrchestrator:
         
         # 4. State
         self.current_mood = "calm"
+        # config에 봇 ID가 있으면 가져옴
+        self.bot_id = str(getattr(config, 'BOT_USER_ID', ''))
 
     def process_trigger(self, history: List[Dict], calling_message: Dict) -> str:
         """
@@ -69,9 +70,7 @@ class BotOrchestrator:
         # -------------------------------------------------------
         # 입력 로그를 청크로 변환하고, 닉네임 변경 등을 감지합니다.
         chunked_memories = self._perceive(history, calling_message)
-        
-        # STM 주입 (Inject)
-        self.stm.inject_memories(chunked_memories)
+        self.stm.inject_memories(chunked_memories) # STM 주입 (Inject)
         
         # -------------------------------------------------------
         # Phase 2: Retrieval & Attention (기억 인출 및 집중)
@@ -176,13 +175,12 @@ class BotOrchestrator:
         emotion_vec = self.api.get_embedding(natural_emotion)
         self.social.calculate_and_update_affinity(user_id, emotion_vec)
         
-        # (C) 자가 기억(Self-Memory) STM 저장
-        # 봇의 답변도 기억해야 대화가 이어짐. 감정 태그 보존!
+        # (C) 자가 기억(Self-Memory) STM 저장. 감정 태그 보존!
         bot_mem = MemoryObject(
             content=response_text,
             role="assistant",
-            user_id="bot",
-            user_name="Me",
+            user_id=self.bot_id if self.bot_id else "bot", # ID 일관성 유지
+            user_name=config.BOT_NAME,
             activation=100.0, # 내 말은 중요하므로 높은 초기값
             emotion_tag=natural_emotion
         )
@@ -202,7 +200,12 @@ class BotOrchestrator:
         """
         # --- 1. ID Rendering Helper ---
         # 등장하는 모든 user_id의 닉네임을 캐싱해둠
-        nickname_map = {"bot": "나(AI)", "Me": "나(AI)"}
+        # [Fix] 자아 명확화: LLM이 자신을 '코봇'으로 인식하게 함
+        nickname_map = {
+            "bot": f"{config.BOT_NAME}(Me)", 
+            "Me": f"{config.BOT_NAME}(Me)",
+            "assistant": f"{config.BOT_NAME}(Me)"
+        }
         
         # 현재 유저 닉네임 가져오기
         curr_ctx = self.social.get_user_context(current_user_id)
@@ -220,7 +223,11 @@ class BotOrchestrator:
         # STM (단기 기억) 렌더링
         stm_text = ""
         for m in stm_list:
-            name = render_id(m.user_id, m.user_name)
+            # 봇 자신인 경우 강제로 "코봇(Me)" 사용
+            if m.role == "assistant" or m.user_id == self.bot_id:
+                 name = f"{config.BOT_NAME}(Me)"
+            else:
+                 name = render_id(m.user_id, m.user_name)
             stm_text += f"[{name}]: {m.content}\n"
 
         # LTM (장기 기억) 렌더링
@@ -240,7 +247,7 @@ class BotOrchestrator:
         system_prompt = (
             "당신은 '상황 분석가'입니다. "
             "주어진 [과거 기억]과 [현재 대화]를 종합하여, 현재 대화의 맥락을 3문장 이내로 명확히 요약하세요. "
-            "과거의 사실이 현재 대화에 어떤 영향을 미치는지 설명하세요."
+            f"대화에서 '{config.BOT_NAME}(Me)'은 당신 자신입니다."
         )
         
         user_prompt = f"""
@@ -259,7 +266,7 @@ class BotOrchestrator:
         답변 생성 및 10자 이내 자연어 감정 태그 생성
         """
         system_prompt = f"""
-        당신은 자아와 감정을 가진 AI입니다.
+        당신은 자아와 감정을 가진 사람{config.BOT_NAME}입니다.
         
         [Persona Info]
         - 상대방과의 관계: {relationship}
