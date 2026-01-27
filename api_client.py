@@ -44,11 +44,10 @@ class APILogger:
         """Embedding 로깅 제외 토글"""
         self.exclude_embedding = exclude
         
-    def _truncate(self, text: str, max_len: int = None) -> str:
-        """긴 텍스트 자르기"""
-        max_len = max_len or self.max_content_length
+    def _truncate_embedding(self, text: str, max_len: int = 500) -> str:
+        """임베딩 텍스트만 자르기 (500자 제한)"""
         if text and len(text) > max_len:
-            return text[:max_len] + f"... [truncated, total {len(text)} chars]"
+            return text[:max_len] + f"... [{len(text)}자]"
         return text
     
     def _should_log(self, level: str) -> bool:
@@ -79,7 +78,7 @@ class APILogger:
         self.log({
             "type": "EMBEDDING_REQUEST",
             "model": model,
-            "input_text": self._truncate(text),
+            "input_text": self._truncate_embedding(text),
             "input_length": len(text) if text else 0
         }, level="DEBUG")
     
@@ -89,7 +88,7 @@ class APILogger:
             return
         entry = {
             "type": "EMBEDDING_RESPONSE",
-            "input_preview": self._truncate(text, 100),
+            "input_preview": self._truncate_embedding(text, 100),
             "embedding_dim": embedding_dim,
             "duration_ms": round(duration_ms, 2),
             "success": success
@@ -104,11 +103,9 @@ class APILogger:
             "type": "CHAT_REQUEST",
             "provider": provider,
             "model": model,
-            "system_prompt": self._truncate(system_prompt),
-            "user_prompt": self._truncate(user_prompt),
-            "json_mode": json_mode,
-            "system_prompt_length": len(system_prompt) if system_prompt else 0,
-            "user_prompt_length": len(user_prompt) if user_prompt else 0
+            "system_prompt": system_prompt or "",
+            "user_prompt": user_prompt or "",
+            "json_mode": json_mode
         }, level="DEBUG")
     
     def log_chat_response(self, provider: str, model: str, response: str, duration_ms: float, 
@@ -118,8 +115,7 @@ class APILogger:
             "type": "CHAT_RESPONSE",
             "provider": provider,
             "model": model,
-            "response": self._truncate(str(response)),
-            "response_length": len(str(response)) if response else 0,
+            "response": str(response) if response else "",
             "duration_ms": round(duration_ms, 2),
             "success": success
         }

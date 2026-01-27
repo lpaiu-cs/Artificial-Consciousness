@@ -1,11 +1,52 @@
 #!/usr/bin/env python
 """
 CogBot API Log Viewer
-로그를 깔끔하게 정리해서 보여주는 CLI 도구
+## 📋 로그 뷰어 사용법 요약
+
+이제 로그를 깔끔하게 볼 수 있는 CLI 도구 log_viewer.py가 준비되었습니다:
+
+### 기본 사용법
+```bash
+python log_viewer.py              # 전체 로그 (compact 모드)
+python log_viewer.py -x           # Embedding 로그 제외
+python log_viewer.py -d           # 상세 모드
+python log_viewer.py --summary    # 통계 요약만 보기
+```
+
+### 필터링 옵션
+| 옵션 | 설명 |
+|------|------|
+| `-x, --exclude-embedding` | Embedding 요청/응답 제외 |
+| `-p PROVIDER` | 특정 provider만 (OpenAI, Groq) |
+| `-e, --errors` | 에러 로그만 |
+| `-r, --responses` | 응답 로그만 (요청 제외) |
+| `-n N` | 최근 N개만 표시 |
+| `-d, --detailed` | 상세 모드 (프롬프트/응답 전체) |
+| `-s, --summary` | 통계 요약 |
+| `--no-color` | 색상 없이 출력 |
+
+### 조합 예시
+```bash
+python log_viewer.py -x -d -n 10         # Embedding 제외, 상세모드, 최근 10개
+python log_viewer.py -p OpenAI --summary # OpenAI만 + 통계
+python log_viewer.py -e                   # 에러만 보기
+```
+
+### 런타임 설정 (코드에서)
+```python
+api_client.set_exclude_embedding_log(True)   # Embedding 로깅 끄기
+api_client.set_logging(False)                # 전체 로깅 끄기
+```
+
+### 설정 파일 (config.py)
+- `API_LOG_EXCLUDE_EMBEDDING = True` → 기본적으로 Embedding 로그 제외
+
+Made changes.
 """
 import json
 import argparse
 import os
+import sys
 from datetime import datetime
 from typing import List, Dict, Optional
 
@@ -20,6 +61,12 @@ class Colors:
     GRAY = '\033[90m'
     BOLD = '\033[1m'
     END = '\033[0m'
+    
+    @classmethod
+    def disable(cls):
+        """모든 색상 코드 비활성화"""
+        for attr in ['HEADER', 'BLUE', 'CYAN', 'GREEN', 'YELLOW', 'RED', 'GRAY', 'BOLD', 'END']:
+            setattr(cls, attr, '')
 
 
 class APILogViewer:
@@ -90,38 +137,81 @@ class APILogViewer:
             return f"{ms:.0f}ms"
         return f"{ms/1000:.2f}s"
     
+    def wrap_text(self, text: str, width: int = 80, indent: str = "    ") -> str:
+        """긴 텍스트를 적절히 줄바꿈"""
+        if not text:
+            return ""
+        
+        lines = []
+        # 기존 줄바꿈 유지
+        for paragraph in text.split('\n'):
+            if len(paragraph) <= width:
+                lines.append(paragraph)
+            else:
+                # width 길이로 자르기
+                while len(paragraph) > width:
+                    # 공백 위치 찾기
+                    split_pos = paragraph.rfind(' ', 0, width)
+                    if split_pos == -1:
+                        split_pos = width
+                    lines.append(paragraph[:split_pos])
+                    paragraph = paragraph[split_pos:].lstrip()
+                if paragraph:
+                    lines.append(paragraph)
+        
+        # 첫 줄 제외 indent 추가
+        if len(lines) > 1:
+            return lines[0] + '\n' + '\n'.join(indent + line for line in lines[1:])
+        return lines[0] if lines else ""
+    
     def display_compact(self, entries: List[Dict]):
         """컴팩트 뷰 (한 줄씩)"""
-        print(f"\n{Colors.BOLD}{'시간':<10} {'타입':<12} {'Provider':<8} {'모델':<20} {'상태':<8} {'소요시간':<10}{Colors.END}")
-        print("─" * 75)
+        # 헤더
+        header = f"{'시간':<10} {'타입':<10} {'Provider':<8} {'모델':<22} {'상태':<6} {'소요시간':<10}"
+        print(f"\n{Colors.BOLD}{header}{Colors.END}")
+        print("-" * 70)
         
         for e in entries:
             time_str = self.format_timestamp(e.get('timestamp', ''))
             entry_type = e.get('type', 'UNKNOWN')
             provider = e.get('provider', '-')
-            model = e.get('model', '-')[:18]
+            model = (e.get('model', '-') or '-')[:20]
             
-            # 상태 색상
+            # 타입 표시 (색상 없는 기본값)
+            if 'EMBEDDING' in entry_type:
+                type_display = "EMBED"
+                type_colored = f"{Colors.GRAY}{type_display}{Colors.END}"
+            elif 'CHAT' in entry_type:
+                type_display = "CHAT"
+                type_colored = f"{Colors.CYAN}{type_display}{Colors.END}"
+            else:
+                type_display = entry_type[:8]
+                type_colored = type_display
+            
+            # 상태 표시
             if 'REQUEST' in entry_type:
-                status = f"{Colors.BLUE}→ REQ{Colors.END}"
+                status_display = "REQ"
+                status_colored = f"{Colors.BLUE}-> REQ{Colors.END}"
                 duration = "-"
             else:
                 success = e.get('success', True)
                 if success:
-                    status = f"{Colors.GREEN}✓ OK{Colors.END}"
+                    status_display = "OK"
+                    status_colored = f"{Colors.GREEN}OK{Colors.END}"
                 else:
-                    status = f"{Colors.RED}✗ ERR{Colors.END}"
+                    status_display = "ERR"
+                    status_colored = f"{Colors.RED}ERR{Colors.END}"
                 duration = self.format_duration(e.get('duration_ms', 0))
             
-            # 타입 색상
-            if 'EMBEDDING' in entry_type:
-                type_str = f"{Colors.GRAY}EMBED{Colors.END}"
-            elif 'CHAT' in entry_type:
-                type_str = f"{Colors.CYAN}CHAT{Colors.END}"
+            # 색상이 비활성화되면 기본 텍스트 사용
+            if Colors.END == '':
+                type_str = f"{type_display:<10}"
+                status_str = f"{status_display:<6}"
             else:
-                type_str = entry_type[:10]
+                type_str = f"{type_colored:<19}"  # ANSI 코드 포함 길이 보정
+                status_str = f"{status_colored:<15}"
             
-            print(f"{time_str:<10} {type_str:<20} {provider:<8} {model:<20} {status:<16} {duration:<10}")
+            print(f"{time_str:<10} {type_str} {provider:<8} {model:<22} {status_str} {duration:<10}")
     
     def display_detailed(self, entries: List[Dict]):
         """상세 뷰 (카드 형식)"""
@@ -136,7 +226,7 @@ class APILogViewer:
             else:
                 header_color = Colors.GREEN
             
-            print(f"\n{header_color}{'━' * 60}{Colors.END}")
+            print(f"\n{header_color}{'=' * 80}{Colors.END}")
             print(f"{header_color}[{i}] {entry_type}{Colors.END}")
             print(f"{Colors.GRAY}시간: {e.get('timestamp', 'N/A')}{Colors.END}")
             
@@ -148,10 +238,12 @@ class APILogViewer:
             
             # Request 정보
             if 'REQUEST' in entry_type:
-                if 'system_prompt' in e:
-                    print(f"  {Colors.GRAY}[System]{Colors.END} {e['system_prompt'][:100]}...")
-                if 'user_prompt' in e:
-                    print(f"  {Colors.CYAN}[User]{Colors.END} {e['user_prompt'][:100]}...")
+                if 'system_prompt' in e and e['system_prompt']:
+                    sys_text = self.wrap_text(e['system_prompt'], width=76, indent="           ")
+                    print(f"  {Colors.GRAY}[System]{Colors.END} {sys_text}")
+                if 'user_prompt' in e and e['user_prompt']:
+                    user_text = self.wrap_text(e['user_prompt'], width=76, indent="         ")
+                    print(f"  {Colors.CYAN}[User]{Colors.END} {user_text}")
                 if e.get('json_mode'):
                     print(f"  {Colors.YELLOW}JSON Mode: ON{Colors.END}")
             
@@ -161,14 +253,14 @@ class APILogViewer:
                 print(f"  소요시간: {Colors.BOLD}{duration}{Colors.END}")
                 
                 if e.get('success'):
-                    if 'response' in e:
-                        resp = str(e['response'])[:150]
-                        print(f"  {Colors.GREEN}[Response]{Colors.END} {resp}...")
+                    if 'response' in e and e['response']:
+                        resp_text = self.wrap_text(str(e['response']), width=76, indent="              ")
+                        print(f"  {Colors.GREEN}[Response]{Colors.END} {resp_text}")
                     if 'token_usage' in e:
                         t = e['token_usage']
                         print(f"  토큰: {t.get('prompt_tokens', 0)} + {t.get('completion_tokens', 0)} = {Colors.BOLD}{t.get('total_tokens', 0)}{Colors.END}")
                 else:
-                    print(f"  {Colors.RED}❌ 에러: {e.get('error', 'Unknown error')}{Colors.END}")
+                    print(f"  {Colors.RED}[Error]{Colors.END} {e.get('error', 'Unknown error')}")
     
     def display_summary(self, entries: List[Dict]):
         """통계 요약"""
@@ -279,11 +371,9 @@ def main():
     
     args = parser.parse_args()
     
-    # 색상 비활성화
-    if args.no_color:
-        for attr in dir(Colors):
-            if not attr.startswith('_'):
-                setattr(Colors, attr, '')
+    # 색상 비활성화 (파일로 리다이렉트하거나 --no-color 옵션 시)
+    if args.no_color or not sys.stdout.isatty():
+        Colors.disable()
     
     # 뷰어 생성 및 로드
     viewer = APILogViewer(args.file)
