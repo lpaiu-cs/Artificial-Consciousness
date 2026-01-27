@@ -22,7 +22,8 @@ class SocialManager:
 
         # [Security] 예약어 설정 (어뷰징 방지)
         # 이 단어들이 포함된 닉네임은 시스템이 강제로 태깅합니다.
-        self.reserved_nicknames = {"코봇", "CogBot", "Admin", "System", "관리자", "Dev", "운영자"}
+        self.reserved_nicknames = {f"{config.BOT_NAME}", "Bot", "Admin", "System", "관리자", "개발자", "운영자",
+                                   "Developer", "Administrator", "Moderator", "me", "나"}
 
     def get_user_context(self, user_id: str) -> Dict[str, Any]:
         """
