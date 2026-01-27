@@ -10,7 +10,8 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 # Model Config
 EMBEDDING_MODEL = "text-embedding-3-small"
 SMART_MODEL = "gpt-4o"
-FAST_MODEL = "llama3-70b-8192"
+FAST_MODEL = "llama-3.1-8b-instant"
+# FAST_MODEL = "llama-3.1-70b-versatile"
 
 # Memory Config
 STM_CAPACITY = 15
@@ -55,3 +56,10 @@ POSITIVE_EMOTION_ANCHOR = "joyful trust and happiness"
 
 # 호감도 변화 스케일링 (유사도 1.0일 때 최대 몇 점 변할지)
 SOCIAL_SENSITIVITY = 5.0
+
+# === API Logging Config ===
+API_LOGGING_ENABLED = True          # API 로깅 on/off (테스트 시 False로 설정)
+API_LOG_FILE = "api_logs.jsonl"     # 로그 파일 경로
+API_LOG_LEVEL = "DEBUG"             # DEBUG: 전체, INFO: 요약만, WARNING: 에러만
+API_LOG_MAX_CONTENT_LENGTH = 500    # 로그에 기록할 최대 콘텐츠 길이 (truncate)
+API_LOG_EXCLUDE_EMBEDDING = False   # Embedding 로그 제외 (True면 채팅만 기록)
