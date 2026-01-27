@@ -1,0 +1,9 @@
+__pycache__/
+modules/__pycache__/
+/tests/__pycache__/
+
+
+# test 관련 로직.
+/tests/
+run_tests.py
+pytest.ini

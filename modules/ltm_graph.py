@@ -176,6 +176,14 @@ class MemoryGraph:
             self._save_snapshot() # 전체 덤프
             self._clear_log()     # 로그 비우기
             print("✅ Checkpoint Complete.")
+    
+    def save_all(self):
+        """Alias for checkpoint - saves current state to disk"""
+        self.checkpoint()
+    
+    def compact(self):
+        """Alias for checkpoint - compacts logs into snapshot"""
+        self.checkpoint()
 
     def _append_log(self, action: str, payload: Dict):
         """Delta Log 파일에 변경 사항 한 줄 추가 (Append Only)"""
