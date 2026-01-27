@@ -1,10 +1,10 @@
 import re
-import numpy as np
-from typing import List, Dict, Tuple
+import time
+from typing import List, Dict, Tuple, Any
 
 # Config & Structs
 import config
-from memory_structures import RetrievalQuery, MemoryObject
+from memory_structures import RetrievalQuery, MemoryObject, EpisodeNode, InsightNode
 
 # Modules
 from api_client import UnifiedAPIClient
@@ -13,7 +13,7 @@ from modules.stm_handler import WorkingMemory
 from modules.ltm_graph import MemoryGraph
 from modules.ltm_handler import LongTermMemory
 from modules.reflection_handler import ReflectionHandler
-from modules.social_module import SocialMap
+from modules.social_module import SocialManager
 
 '''
 TODO:
@@ -27,232 +27,268 @@ after work:
 '''
 
 class BotOrchestrator:
+    """
+    [The Ego: Central Controller]
+    인지 과정(Perception -> Retrieval -> Cognition -> Action)을 조율합니다.
+    복잡한 세부 로직은 각 모듈로 위임하고, '의사결정'과 '데이터 흐름'만 관리합니다.
+    """
+    
     def __init__(self):
+        # 1. Infrastructure
         self.api = UnifiedAPIClient()
-        self.sensory = SensorySystem(self.api)
-        self.stm = WorkingMemory()
-        self.ltm_graph = MemoryGraph()
-        self.ltm = LongTermMemory(self.ltm_graph, self.api)
-        self.social = SocialMap()
+        self.ltm_graph = MemoryGraph() # Thread-Safe Graph DB
         
-        self.current_mood = "calm"
-        self.positive_anchor_vec = self.api.get_embedding(config.POSITIVE_EMOTION_ANCHOR)
+        # 2. Functional Modules
+        self.social = SocialManager(self.ltm_graph, self.api) # Social Brain
+        self.sensory = SensorySystem(self.api)                # Eyes & Ears
+        self.stm = WorkingMemory()                            # Short-term Memory
+        self.ltm = LongTermMemory(self.ltm_graph, self.api)   # Long-term Memory Retrieval
         
-        # Background Process
+        # 3. Background Process
         self.reflector = ReflectionHandler(self.ltm_graph, self.api)
         self.reflector.start_background_loop(
             self.stm.eviction_buffer, interval=config.REFLECTION_INTERVAL
         )
+        
+        # 4. State
+        self.current_mood = "calm"
 
     def process_trigger(self, history: List[Dict], calling_message: Dict) -> str:
         """
-        Main cognitive loop
-
-        # I. Trigger (1)
-        트리거로 최근 대화기록(history)과 트리거 이벤트(calling_message)를 받음으로써 호출됨.
+        [Main Cognitive Loop]
+        외부에서 호출되는 진입점입니다.
         """
         user_id = str(calling_message.get("user_id"))
-
-        # II. Perception (2)
+        
+        # -------------------------------------------------------
+        # Phase 1: Perception (지각)
+        # -------------------------------------------------------
+        # 입력 로그를 청크로 변환하고, 닉네임 변경 등을 감지합니다.
         chunked_memories = self._perceive(history, calling_message)
-        # Inject into Working Memory (STM) (3)
+        
+        # STM 주입 (Inject)
         self.stm.inject_memories(chunked_memories)
         
-        # III. Retrieval & Attention (4, 5, 6, 7) - 수정점. 5 이름이 Search and Traverse인데, Attention이 빠졌고, 5와 6의 경계가 불분명.
-        query_text = chunked_memories[-1].content
+        # -------------------------------------------------------
+        # Phase 2: Retrieval & Attention (기억 인출 및 집중)
+        # -------------------------------------------------------
+        # 현재 대화의 마지막 발화를 쿼리로 사용
+        last_chunk = chunked_memories[-1]
+        query_text = last_chunk.content
+        
+        # LTM 검색 (3-Tier Graph Search)
         retrieved_nodes = self._retrieve_and_attend(query_text, user_id)
         
-        # IV. Cognition & Context Reconstruction (8)
-        context_summary = self._think(chunked_memories, retrieved_nodes)
-        rel_desc = self.social.get_relationship_desc(user_id)
+        # -------------------------------------------------------
+        # Phase 3: Cognition (사고 및 맥락 구성)
+        # -------------------------------------------------------
+        # STM과 LTM을 조합하여 LLM이 이해할 수 있는 텍스트로 변환 (ID -> Nickname 치환)
+        context_summary = self._think(retrieved_nodes, user_id)
         
-        # V. Action (9)
-        response = self._act(user_id, query_text, context_summary, rel_desc)
+        # 유저와의 관계 정보 가져오기 (LLM 페르소나 조절용)
+        user_ctx = self.social.get_user_context(user_id)
+        relationship_desc = user_ctx["desc"] # 예: "Close Friend (85.0)"
+        
+        # -------------------------------------------------------
+        # Phase 4: Action (행동 및 학습)
+        # -------------------------------------------------------
+        response = self._act(user_id, query_text, context_summary, relationship_desc)
         
         return response
 
-    # --- Private Pipelines ---
+    # =========================================================================
+    # Internal Pipelines
+    # =========================================================================
 
-    # Sensory System (Chunking)
     def _perceive(self, history, current_msg) -> List[MemoryObject]:
-        # 1. 청킹 및 임베딩 (기존 로직)
+        """
+        [Sensory Processing]
+        Raw Data -> Memory Objects
+        """
+        # 1. 청킹 및 임베딩 생성 (Sensory System 위임)
         chunks = self.sensory.process_input(history, current_msg)
         
-        # 2. [New] 정체성 확인 (Identity Check)
+        # 2. 정체성(Identity) 확인 (Social Manager 위임)
         user_id = str(current_msg.get("user_id"))
         nickname = current_msg.get("user_name", "Unknown")
         
-        is_changed = self.social.update_identity(user_id, nickname)
+        # 닉네임이 바뀌었다면 그래프 갱신 및 시스템 알림 생성 여부 판단
+        # (현재 구현상 process_identity는 False만 리턴하지만, 추후 확장 시 여기서 시스템 메시지 추가 가능)
+        self.social.process_identity(user_id, nickname)
         
-        if is_changed:
-            # 닉네임 변경 사실을 STM에 강제 주입!
-            # 봇이 "어? 닉네임 바꿨네?"라고 인식하게 만듦
-            old_name = self.social.social_data[user_id]["history"][-1]
-            change_event = MemoryObject(
-                content=f"시스템 알림: 유저({user_id})가 닉네임을 '{old_name}'에서 '{nickname}'(으)로 변경했습니다.",
-                role="system",
-                user_id=user_id,
-                user_name="System",
-                activation=100.0 # 매우 중요함
-            )
-            # 임베딩 생성 후 주입
-            change_event.embedding = self.api.get_embedding(change_event.content)
-            chunks.append(change_event)
-
         return chunks
     
     def _retrieve_and_attend(self, query_text: str, user_id: str):
-        # Create Query
+        """
+        [Memory Retrieval]
+        Vector Search -> Graph Spreading -> Semantic Attention
+        """
+        # 1. Query 생성
         query_embedding = self.api.get_embedding(query_text)
         query = RetrievalQuery(
             embedding=query_embedding,
             user_id=user_id,
-            keywords=query_text.split(),
+            keywords=query_text.split(), # 키워드도 여전히 보조적으로 사용
             current_mood=self.current_mood
         )
         
-        # LTM Handler (Retrieval)
+        # 2. LTM 검색 (LTM Handler 위임)
         nodes = self.ltm.retrieve(query, top_k=3)
         
-        # STM Attention (Vector Semantic Matching)
+        # 3. STM Attention (Vector-based)
+        # 검색된 내용이 아니라 '현재 쿼리'에 집중하도록 STM 활성도 갱신
         self.stm.update_activations(query_embedding)
         
         return nodes
 
-    def _think(self, stm_chunks, ltm_nodes) -> str:
+    def _think(self, ltm_nodes, current_user_id) -> str:
+        """
+        [Cognitive Reconstruction]
+        STM과 LTM의 데이터를 LLM이 읽기 쉬운 '자연어 요약'으로 변환합니다.
+        [중요] 이때 기계적인 ID("12345")를 닉네임("민초단장")으로 렌더링합니다.
+        """
+        # 1. STM에서 전체 대화 흐름 가져오기
         stm_context = self.stm.get_chronological_context()
-        # Fast LLM을 이용한 요약
-        return self._run_fast_reconstruction(stm_context, ltm_nodes)
+        
+        # 2. Fast LLM(System 1)에게 요약 요청
+        return self._run_fast_reconstruction(stm_context, ltm_nodes, current_user_id)
 
-    def _act(self, user_id, user_input, context, relationship) -> str:
+    def _act(self, user_id, user_input, context_summary, relationship_desc) -> str:
         """
-        Action: 답변 생성 -> 감정 변화 -> 관계(호감도) 계산 -> 기억 저장
+        [Action & Feedback Loop]
+        Generate Response -> Update Mood -> Update Relationship -> Save Memory
         """
-        # 1. LLM 생성 (자연어 감정 태그 포함)
+        # 1. System 2 (Slow Thinking) - 답변 및 자연어 감정 생성
         response_text, natural_emotion = self._run_slow_generation(
-            user_input, context, relationship, self.current_mood
+            user_input, context_summary, relationship_desc, self.current_mood
         )
         
         # 2. Feedback Loop
-        # (1) 기분 업데이트 (자연어 그대로)
+        # (A) 기분 업데이트
         self.current_mood = natural_emotion
         
-        # (2) [New] 벡터 기반 관계 업데이트
-        self._update_social_relationship(user_id, natural_emotion)
+        # (B) 관계 업데이트 (Social Manager 위임)
+        # 봇이 느낀 감정("싸늘함")을 벡터로 변환해 관계 점수에 반영
+        emotion_vec = self.api.get_embedding(natural_emotion)
+        self.social.calculate_and_update_affinity(user_id, emotion_vec)
         
-        # (3) 자가 기억 STM 저장 (감정 태그 그대로 보존)
+        # (C) 자가 기억(Self-Memory) STM 저장
+        # 봇의 답변도 기억해야 대화가 이어짐. 감정 태그 보존!
         bot_mem = MemoryObject(
             content=response_text,
             role="assistant",
             user_id="bot",
             user_name="Me",
-            activation=100.0,
-            emotion_tag=natural_emotion # "싸늘한 분노" 등이 그대로 들어감
+            activation=100.0, # 내 말은 중요하므로 높은 초기값
+            emotion_tag=natural_emotion
         )
         self.stm.inject_memories([bot_mem])
         
         return response_text
 
-    def _update_social_relationship(self, user_id: str, current_emotion_text: str):
-        """
-        [Vector-based Social Logic]
-        현재 봇의 기분(current_emotion)이 '긍정(Positive Anchor)'과 얼마나 가까운가?
-        가까우면 호감도 상승, 멀면 하락.
-        """
-        # 1. 현재 감정 임베딩
-        emotion_vec = self.api.get_embedding(current_emotion_text)
-        
-        # 2. 코사인 유사도 계산 (-1.0 ~ 1.0)
-        similarity = self._cosine_similarity(emotion_vec, self.positive_anchor_vec)
-        
-        # 3. 점수 매핑 (Mapping Strategy)
-        # 유사도 1.0 (완전 긍정) -> +5.0점
-        # 유사도 0.0 (무관/중립) -> 0.0점
-        # 유사도 -1.0 (완전 반대) -> -5.0점
-        # 단, 노이즈를 줄이기 위해 유사도 0.2 미만은 무시할 수도 있음 (여기선 그대로 적용)
-        
-        delta = similarity * config.SOCIAL_SENSITIVITY
-        
-        # 4. 업데이트 적용
-        self.social.update_affinity(user_id, delta)
-        
-        # Debug Log
-        # print(f"❤️ [Social] '{current_emotion_text}' (Sim: {similarity:.2f}) -> Delta: {delta:+.2f}")
-
-    def _cosine_similarity(self, vec_a, vec_b):
-        a = np.array(vec_a)
-        b = np.array(vec_b)
-        norm_a = np.linalg.norm(a)
-        norm_b = np.linalg.norm(b)
-        if norm_a == 0 or norm_b == 0: return 0.0
-        return np.dot(a, b) / (norm_a * norm_b)
-
-    # --- LLM Wrappers ---
+    # =========================================================================
+    # LLM Wrappers (Prompt Engineering Layer)
+    # =========================================================================
     
-    def _run_fast_reconstruction(self, stm_list, ltm_nodes) -> str:
+    def _run_fast_reconstruction(self, stm_list, ltm_nodes, current_user_id) -> str:
         """
-        [System 1] Groq: 기억 파편들을 읽기 쉬운 텍스트로 요약
+        [System 1: Groq]
+        파편화된 기억들을 읽기 쉬운 상황 요약문으로 변환합니다.
+        *ID Rendering 적용*
         """
-        # 1. 프롬프트 데이터 구성
-        stm_text = "\n".join([f"[{m.user_name}]: {m.content}" for m in stm_list])
+        # --- 1. ID Rendering Helper ---
+        # 등장하는 모든 user_id의 닉네임을 캐싱해둠
+        nickname_map = {"bot": "나(AI)", "Me": "나(AI)"}
+        
+        # 현재 유저 닉네임 가져오기
+        curr_ctx = self.social.get_user_context(current_user_id)
+        nickname_map[current_user_id] = curr_ctx["nickname"]
+        
+        def render_id(uid, default_name):
+            if uid in nickname_map: return nickname_map[uid]
+            # 캐시에 없으면 조회
+            ctx = self.social.get_user_context(uid)
+            nickname_map[uid] = ctx["nickname"]
+            return ctx["nickname"]
+
+        # --- 2. Prompt Construction ---
+        
+        # STM (단기 기억) 렌더링
+        stm_text = ""
+        for m in stm_list:
+            name = render_id(m.user_id, m.user_name)
+            stm_text += f"[{name}]: {m.content}\n"
+
+        # LTM (장기 기억) 렌더링
         ltm_text = ""
         for node in ltm_nodes:
-            if hasattr(node, 'summary'): 
-                ltm_text += f"- (Fact) {node.summary}\n"
-            else: 
-                ltm_text += f"- (Memory) {node.content} (Emotion: {node.emotion_tag})\n"
-        
-        # 2. 프롬프트 분리 (System / User)
+            if isinstance(node, InsightNode):
+                # Insight는 subject(대상)가 누구인지가 중요
+                # node.user_id 같은 필드가 없다면 subject 필드를 활용하거나 연결된 Entity 확인 필요
+                # 여기서는 텍스트 자체를 신뢰
+                ltm_text += f"- (Fact) {node.summary} (신뢰도: {node.confidence})\n"
+            elif isinstance(node, EpisodeNode):
+                # Episode의 user_id 렌더링
+                name = render_id(node.user_id, "Unknown")
+                ltm_text += f"- (Memory) {name}가 말하길: {node.content} (기분: {node.emotion_tag})\n"
+
+        # --- 3. Call API ---
         system_prompt = (
-            "당신은 상황 분석가입니다. "
-            "주어진 [장기 기억]과 [현재 대화]를 바탕으로, 현재 대화의 맥락을 3문장 이내로 요약하세요. "
-            "특히 과거 기억이 현재 대화와 어떻게 연결되는지 명시하세요."
+            "당신은 '상황 분석가'입니다. "
+            "주어진 [과거 기억]과 [현재 대화]를 종합하여, 현재 대화의 맥락을 3문장 이내로 명확히 요약하세요. "
+            "과거의 사실이 현재 대화에 어떤 영향을 미치는지 설명하세요."
         )
         
         user_prompt = f"""
-        [Long-term Memory]
+        [Relevant Memories]
         {ltm_text}
         
-        [Current Conversation]
+        [Current Conversation Flow]
         {stm_text}
         """
 
-        # 3. API 호출 (Groq)
         return self.api.chat_fast(system_prompt, user_prompt)
     
     def _run_slow_generation(self, user_input, context, relationship, bot_mood) -> Tuple[str, str]:
         """
-        [System 2] GPT-4: 답변 및 10자 이내 자연어 감정 생성
+        [System 2: GPT-4]
+        답변 생성 및 10자 이내 자연어 감정 태그 생성
         """
         system_prompt = f"""
-        당신은 자아를 가진 AI입니다. 
-        유저와의 관계({relationship})와 현재 당신의 기분("{bot_mood}")을 반영하여 답변하세요.
+        당신은 자아와 감정을 가진 AI입니다.
         
-        [출력 규칙]
-        답변 끝에 당신이 느끼는 **구체적인 감정**을 [FEELING:감정어] 형태로 붙이세요.
-        - 감정어는 10자 이내의 자연어로 자유롭게 표현하세요. (예: "묘한 설렘", "차가운 분노", "귀찮음", "안도감")
-        - 이때, 카테고리로 분류가 아닌, **뉘앙스**를 살리세요.
+        [Persona Info]
+        - 상대방과의 관계: {relationship}
+        - 현재 당신의 기분: "{bot_mood}"
         
-        Example Output: "아 진짜? 그건 좀 너무했다. [FEELING:어이없음]"
+        [Task]
+        1. 상대방의 말에 대해 페르소나와 기분을 반영하여 자연스럽게 답변하세요.
+        2. 답변 끝에 당신이 지금 느끼는 솔직한 감정을 [FEELING:감정] 태그로 붙이세요.
+        
+        [Rule]
+        - 감정은 '기쁨', '슬픔' 같은 카테고리가 아니라, "약간 설렘", "차가운 경멸", "따뜻한 위로" 처럼 10자 이내의 자연어로 표현하세요.
+        - [FEELING:...] 태그는 답변의 맨 마지막에 딱 한 번만 나와야 합니다.
+        
+        Example: "진짜? 와, 그거 완전 대박이다! [FEELING:놀라움과 부러움]"
         """
         
         user_prompt = f"""
-        [상황]
+        [Context Summary]
         {context}
         
-        [유저]
+        [User Input]
         "{user_input}"
         """
         
         full_response = self.api.chat_slow(system_prompt, user_prompt)
         
-        # 파싱 로직
+        # Parse Tag
         tag_pattern = r"\[FEELING:(.*?)\]"
         match = re.search(tag_pattern, full_response)
         
         if match:
-            emotion = match.group(1).strip()[:10] # 10자 제한 안전장치
+            emotion = match.group(1).strip()[:10]
             text = re.sub(tag_pattern, "", full_response).strip()
             return text, emotion
         else:
-            return full_response, "calm" # 기본값
+            return full_response, bot_mood # 태그 없으면 기존 기분 유지
