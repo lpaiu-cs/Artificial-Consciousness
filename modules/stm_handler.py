@@ -114,9 +114,3 @@ class WorkingMemory:
             # 힙은 최소값이 루트(0번 인덱스)에 있으므로 pop하면 가장 점수 낮은 놈이 나옴
             evicted_mem = heapq.heappop(self.memory_queue)
             self.eviction_buffer.append(evicted_mem)
-
-    # --- Helper for MemoryObject comparison in Heap ---
-    # MemoryObject 클래스에 __lt__가 구현되어 있지 않다면
-    # heapq가 객체 비교 시 에러를 낼 수 있음.
-    # 이를 해결하기 위해 MemoryObject(dataclass)에 order=True를 주거나
-    # 여기서 래퍼를 써야 함. 가장 깔끔한 건 memory_structures.py 수정.

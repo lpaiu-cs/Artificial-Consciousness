@@ -204,7 +204,8 @@ class BotOrchestrator:
         nickname_map = {
             "bot": f"{config.BOT_NAME}(Me)", 
             "Me": f"{config.BOT_NAME}(Me)",
-            "assistant": f"{config.BOT_NAME}(Me)"
+            "assistant": f"{config.BOT_NAME}(Me)",
+            self.bot_id: f"{config.BOT_NAME}(Me)"
         }
         
         # 현재 유저 닉네임 가져오기
@@ -225,9 +226,9 @@ class BotOrchestrator:
         for m in stm_list:
             # 봇 자신인 경우 강제로 "코봇(Me)" 사용
             if m.role == "assistant" or m.user_id == self.bot_id:
-                 name = f"{config.BOT_NAME}(Me)"
+                name = f"{config.BOT_NAME}(Me)"
             else:
-                 name = render_id(m.user_id, m.user_name)
+                name = render_id(m.user_id, m.user_name)
             stm_text += f"[{name}]: {m.content}\n"
 
         # LTM (장기 기억) 렌더링
@@ -240,7 +241,10 @@ class BotOrchestrator:
                 ltm_text += f"- (Fact) {node.summary} (신뢰도: {node.confidence})\n"
             elif isinstance(node, EpisodeNode):
                 # Episode의 user_id 렌더링
-                name = render_id(node.user_id, "Unknown")
+                if node.user_id == self.bot_id:
+                    name = f"{config.BOT_NAME}(Me)"
+                else:
+                    name = render_id(node.user_id, "Unknown")
                 ltm_text += f"- (Memory) {name}가 말하길: {node.content} (기분: {node.emotion_tag})\n"
 
         # --- 3. Call API ---
