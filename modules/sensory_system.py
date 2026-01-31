@@ -30,6 +30,7 @@ class SensorySystem:
         raw_logs = history + [current_msg] if current_msg else history
         if not raw_logs:
             return []
+        raw_logs.sort(key=lambda x: x.get("timestamp", 0.0))  # 타임스탬프 기준  정렬
 
         chunked_memories = []
 

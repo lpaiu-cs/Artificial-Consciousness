@@ -23,8 +23,10 @@ class MemoryObject:
         return asdict(self)
     
     def __lt__(self, other):
-        # 활성도가 낮은 순서대로 정렬 (Min-Heap)
-        return self.activation < other.activation
+        if self.activation != other.activation:
+            # 활성도가 낮은 순서대로 정렬 (Min-Heap)
+            return self.activation < other.activation
+        return self.timestamp < other.timestamp # 동점 시 오래된 것이 우선
 
 @dataclass
 class RetrievalQuery:

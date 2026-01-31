@@ -22,7 +22,6 @@ class WorkingMemory:
         """
         [Input] 감각 시스템에서 넘어온 새로운 청크들을 STM에 주입
         """
-        current_time = time.time()
         
         for mem in memories:
             # 신규 기억은 초기 활성도가 높음 (config.py 참조)
@@ -30,11 +29,10 @@ class WorkingMemory:
             # MemoryObject 자체를 넣고 __lt__ 등을 정의하거나,
             # 여기서는 간단히 리스트 관리 후 heapify 방식을 사용.
             
-            # 덮어쓰기 방지: timestamp 미세 조정
-            mem.timestamp = current_time 
-            current_time += 0.001 
+            if not mem.timestamp:
+                mem.timestamp = time.time()
             
-            heapq.heappush(self.memory_queue, mem)
+            heapq.heappush(self.memory_queue, mem) # activation 기준 heap
             
         # 주입 직후 용량 초과 시, 즉시 정리하지 않고
         # update_activations 단계에서 "점수 계산 후" 방출하는 것이 더 스마트함.
