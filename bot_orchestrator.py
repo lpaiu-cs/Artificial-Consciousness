@@ -63,6 +63,7 @@ class BotOrchestrator:
         # 4. State
         self.current_mood = "calm"
         self.session_state = {"current_mood": "calm"}
+        self.session_states: Dict[str, Dict[str, Any]] = {}
         # config에 봇 ID가 있으면 가져옴
         self.bot_id = str(getattr(config, 'BOT_USER_ID', ''))
 
@@ -72,9 +73,11 @@ class BotOrchestrator:
         외부에서 호출되는 진입점입니다.
         """
         user_id = str(calling_message.get("user_id"))
+        session_state = self._get_session_state(user_id)
         raw_user_input = calling_message.get("msg", "")
         sanitized_history = [self.fast_path_writer.apply_write_barriers(log) for log in history]
         sanitized_message = self.fast_path_writer.apply_write_barriers(calling_message)
+        boundary_requested = bool(sanitized_message and sanitized_message.get("memory_redacted"))
         
         # -------------------------------------------------------
         # Phase 1: Perception (지각)
@@ -95,7 +98,7 @@ class BotOrchestrator:
         query_text = last_chunk.content
         
         # LTM 검색 (3-Tier Graph Search)
-        retrieved_nodes = self._retrieve_and_attend(query_text, user_id)
+        retrieved_nodes = self._retrieve_and_attend(query_text, user_id, session_state["current_mood"])
         
         # -------------------------------------------------------
         # Phase 3: Cognition (사고 및 맥락 구성)
@@ -110,7 +113,14 @@ class BotOrchestrator:
         # -------------------------------------------------------
         # Phase 4: Action (행동 및 학습)
         # -------------------------------------------------------
-        response = self._act(user_id, raw_user_input, context_summary, relationship_desc)
+        response = self._act(
+            user_id,
+            raw_user_input,
+            context_summary,
+            relationship_desc,
+            session_state,
+            boundary_requested=boundary_requested,
+        )
         
         return response
 
@@ -137,7 +147,7 @@ class BotOrchestrator:
         
         return chunks
     
-    def _retrieve_and_attend(self, query_text: str, user_id: str):
+    def _retrieve_and_attend(self, query_text: str, user_id: str, current_mood: str):
         """
         [Memory Retrieval]
         Vector Search -> Graph Spreading -> Semantic Attention
@@ -149,7 +159,7 @@ class BotOrchestrator:
             user_id=user_id,
             keywords=query_text.split(), # 키워드도 여전히 보조적으로 사용
             query_text=query_text,
-            current_mood=self.current_mood
+            current_mood=current_mood
         )
         
         # 2. LTM 검색 (LTM Handler 위임)
@@ -203,25 +213,35 @@ class BotOrchestrator:
         # 2. Fast LLM(System 1)에게 요약 요청
         return self._run_fast_reconstruction(stm_context, memory_context, current_user_id)
 
-    def _act(self, user_id, user_input, context_summary, relationship_desc) -> str:
+    def _act(self, user_id, user_input, context_summary, relationship_desc,
+             session_state: Dict[str, Any], boundary_requested: bool = False) -> str:
         """
         [Action & Feedback Loop]
         Generate Response -> Update Mood -> Update Relationship -> Save Memory
         """
         # 1. System 2 (Slow Thinking) - 답변 및 자연어 감정 생성
         response_text, natural_emotion = self._run_slow_generation(
-            user_input, context_summary, relationship_desc, self.current_mood
+            user_input, context_summary, relationship_desc, session_state["current_mood"]
         )
         
         # 2. Feedback Loop
-        # (A) 기분 업데이트
+        # (A) 현재 사용자 세션 기분 업데이트
         self.current_mood = natural_emotion
-        self.session_state["current_mood"] = natural_emotion
+        session_state["current_mood"] = natural_emotion
+        session_state["last_user_input"] = user_input
+        session_state["last_assistant_response"] = response_text
+        session_state["updated_at"] = time.time()
+        self.session_state = session_state
         
         # (B) 관계 업데이트 (Social Manager 위임)
-        # 봇이 생성한 자기 감정보다, 사용자의 실제 발화를 관계 신호로 사용한다.
         interaction_signal_vec = self.api.get_embedding(user_input)
-        self.social.calculate_and_update_affinity(user_id, interaction_signal_vec)
+        self.social.update_relationship(
+            user_id,
+            user_text=user_input,
+            assistant_text=response_text,
+            user_embedding=interaction_signal_vec,
+            boundary_requested=boundary_requested,
+        )
         
         # (C) 자가 기억(Self-Memory) STM 저장. 감정 태그 보존!
         bot_mem = MemoryObject(
@@ -237,6 +257,19 @@ class BotOrchestrator:
         self.reflector.submit_memories([bot_mem])
         
         return response_text
+
+    def _get_session_state(self, user_id: str) -> Dict[str, Any]:
+        state = self.session_states.setdefault(
+            user_id,
+            {
+                "current_mood": "calm",
+                "last_user_input": "",
+                "last_assistant_response": "",
+                "updated_at": 0.0,
+            },
+        )
+        self.session_state = state
+        return state
 
     # =========================================================================
     # LLM Wrappers (Prompt Engineering Layer)

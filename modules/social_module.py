@@ -1,6 +1,7 @@
+import re
 import numpy as np
 import time
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import config
 from memory.canonical_store import CanonicalMemoryStore
 from memory.ontology import Facet
@@ -12,7 +13,7 @@ class SocialManager:
     """
     [Social Brain]
     유저의 정체성(Identity)을 추적하고, 
-    감정 벡터 연산을 통해 관계(Affinity)를 동적으로 업데이트합니다.
+    감정 벡터와 상호작용 사건 신호를 통해 관계 상태를 동적으로 업데이트합니다.
     닉네임 사칭(Impersonation)을 방지하는 보안 로직이 포함됩니다.
     """
     def __init__(self, ltm_graph: MemoryGraph, api_client: UnifiedAPIClient,
@@ -96,36 +97,36 @@ class SocialManager:
 
     def calculate_and_update_affinity(self, user_id: str, current_emotion_vec: list):
         """
-        [Vector Math]
-        (현재 기분 벡터) vs (긍정 앵커 벡터) 유사도 계산 -> 호감도 업데이트
+        [Legacy Wrapper]
+        벡터 기반 기본 관계 업데이트. P2 이후에는 tone-only fallback으로 유지한다.
         """
         if not current_emotion_vec or not self.positive_anchor_vec:
             return
 
-        # 1. 코사인 유사도 계산
         similarity = self._cosine_similarity(current_emotion_vec, self.positive_anchor_vec)
-        
-        # 2. 변화량 계산 (Config 스케일링 적용)
-        # Sim: 1.0 -> +5점, 0.0 -> 0점, -1.0 -> -5점
-        delta = similarity * config.SOCIAL_SENSITIVITY
-        
-        # 3. 그래프 업데이트
-        self.graph.update_affinity(user_id, delta)
-        if self.store:
-            self.store.update_relation_state(
-                user_id,
-                {
-                    "trust": similarity * 0.04,
-                    "warmth": similarity * 0.06,
-                    "familiarity": 0.03,
-                    "respect": similarity * 0.02,
-                    "tension": similarity * -0.05,
-                    "reliability": similarity * 0.03,
-                },
-            )
-        
-        # Debug
-        # print(f"❤️ [Social Update] Sim: {similarity:.2f} -> Delta: {delta:+.2f}")
+        deltas = self._compose_relation_deltas(similarity, {})
+        self._apply_relation_update(user_id, deltas)
+
+    def update_relationship(self, user_id: str, user_text: str, assistant_text: str = "",
+                            user_embedding: Optional[list] = None,
+                            boundary_requested: bool = False) -> Dict[str, float]:
+        """
+        [Event-centric Relation Update]
+        톤 유사도는 약한 베이스 신호로 쓰고, 감사/불만/수정/repair/boundary respect 같은
+        상호작용 사건이 각 축을 다르게 갱신한다.
+        """
+        similarity = 0.0
+        if user_embedding and self.positive_anchor_vec:
+            similarity = self._cosine_similarity(user_embedding, self.positive_anchor_vec)
+
+        signals = self._extract_interaction_signals(
+            user_text=user_text,
+            assistant_text=assistant_text,
+            boundary_requested=boundary_requested,
+        )
+        deltas = self._compose_relation_deltas(similarity, signals)
+        self._apply_relation_update(user_id, deltas)
+        return deltas
 
     def _score_to_desc(self, score: float) -> str:
         """점수를 자연어 관계 설명으로 변환"""
@@ -167,3 +168,118 @@ class SocialManager:
         norm_b = np.linalg.norm(b)
         if norm_a == 0 or norm_b == 0: return 0.0
         return float(np.dot(a, b) / (norm_a * norm_b))
+
+    def _extract_interaction_signals(self, user_text: str, assistant_text: str,
+                                     boundary_requested: bool) -> Dict[str, float]:
+        user = (user_text or "").lower()
+        assistant = (assistant_text or "").lower()
+
+        complaint = self._contains_any(
+            user,
+            ["별로", "실망", "불편", "짜증", "화나", "문제", "심하다", "이상해", "wrong", "bad", "not helpful"],
+        )
+        correction = self._contains_any(
+            user,
+            ["틀렸", "아니야", "수정", "정정", "다시 해", "고쳐", "아닌데", "정확하지", "잘못"],
+        )
+        gratitude = self._contains_any(
+            user,
+            ["고마워", "고맙", "감사", "덕분", "thanks", "thx", "thank you"],
+        )
+        praise = self._contains_any(
+            user,
+            ["좋았", "좋네", "잘했", "최고", "도움됐", "helpful", "great", "nice"],
+        )
+        trust = self._contains_any(
+            user,
+            ["믿", "맡길게", "의지", "trust you", "count on"],
+        )
+        assistant_repair = self._contains_any(
+            assistant,
+            ["미안", "죄송", "사과", "정정", "수정", "바로잡", "다시 설명", "다시 정리"],
+        )
+
+        return {
+            "complaint": float(complaint),
+            "correction": float(correction),
+            "gratitude": float(gratitude),
+            "praise": float(praise),
+            "trust": float(trust),
+            "boundary_respected": float(boundary_requested),
+            "repair": float(assistant_repair and (complaint or correction)),
+        }
+
+    def _compose_relation_deltas(self, similarity: float,
+                                 signals: Dict[str, float]) -> Dict[str, float]:
+        positive_tone = max(similarity, 0.0)
+        negative_tone = max(-similarity, 0.0)
+        gratitude = signals.get("gratitude", 0.0)
+        praise = signals.get("praise", 0.0)
+        complaint = signals.get("complaint", 0.0)
+        correction = signals.get("correction", 0.0)
+        trust_signal = signals.get("trust", 0.0)
+        repair = signals.get("repair", 0.0)
+        boundary_respected = signals.get("boundary_respected", 0.0)
+
+        return {
+            "affinity": (
+                similarity * config.SOCIAL_SENSITIVITY
+                + gratitude * 1.4
+                + praise * 1.0
+                + trust_signal * 0.8
+                + repair * 0.7
+                + boundary_respected * 0.5
+                - complaint * 1.3
+                - correction * 0.8
+            ),
+            "warmth": (
+                positive_tone * 0.03
+                - negative_tone * 0.015
+                + gratitude * 0.08
+                + praise * 0.05
+                - complaint * 0.04
+            ),
+            "trust": (
+                gratitude * 0.03
+                + trust_signal * 0.05
+                + boundary_respected * 0.08
+                + repair * 0.05
+                - complaint * 0.03
+                - correction * 0.02
+            ),
+            "familiarity": (
+                0.025
+                + gratitude * 0.01
+                + praise * 0.01
+            ),
+            "respect": (
+                praise * 0.03
+                + boundary_respected * 0.06
+                + repair * 0.05
+                - complaint * 0.015
+            ),
+            "tension": (
+                negative_tone * 0.02
+                + complaint * 0.08
+                + correction * 0.05
+                - repair * 0.08
+                - gratitude * 0.02
+            ),
+            "reliability": (
+                boundary_respected * 0.05
+                + repair * 0.05
+                - complaint * 0.03
+                - correction * 0.04
+            ),
+        }
+
+    def _apply_relation_update(self, user_id: str, deltas: Dict[str, float]):
+        affinity_delta = deltas.get("affinity", 0.0)
+        self.graph.update_affinity(user_id, affinity_delta)
+        if self.store:
+            relation_deltas = {key: value for key, value in deltas.items() if key != "affinity"}
+            self.store.update_relation_state(user_id, relation_deltas)
+
+    def _contains_any(self, text: str, tokens: list[str]) -> bool:
+        normalized = re.sub(r"\s+", " ", text or "")
+        return any(token in normalized for token in tokens)
