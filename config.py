@@ -54,6 +54,7 @@ EVIDENCE_EDGE_TO_INSIGHT = 1.0   # Episode -> Insight 연결 강도
 # === Storage Paths ===
 LTM_GRAPH_PATH = "ltm_graph.json"       # 그래프 구조 (노드 메타데이터 + 엣지)
 LTM_EMBEDDINGS_PATH = "ltm_embeddings.json"  # 임베딩 벡터 저장소
+CANONICAL_MEMORY_DB_PATH = "memory_state.sqlite3"  # 정본 상태 저장소 (SQLite)
 
 # Social Update Config
 # 이 감정과 가까울수록 호감도가 오르고, 멀수록(반대일수록) 호감도가 떨어집니다.

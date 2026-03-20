@@ -34,6 +34,7 @@ class RetrievalQuery:
     embedding: List[float]
     user_id: str
     keywords: List[str]
+    query_text: str = ""
     intent: str = "chat"
     current_mood: str = "neutral"
 
@@ -108,3 +109,27 @@ class EntityNode(BaseNode):
     affinity: float = 50.0     # 호감도 (0.0 ~ 100.0)
     tags: List[str] = field(default_factory=list) # ["친구", "장난꾸러기"]
     type: str = "entity"
+
+
+@dataclass
+class RelationState:
+    entity_id: str
+    trust: float = 0.5
+    warmth: float = 0.5
+    familiarity: float = 0.1
+    respect: float = 0.5
+    tension: float = 0.0
+    reliability: float = 0.5
+    last_interaction_at: float = 0.0
+
+
+@dataclass
+class OpenLoop:
+    loop_id: str
+    owner_id: str
+    kind: str
+    text: str
+    due_at: Optional[float] = None
+    status: str = "open"
+    priority: int = 0
+    evidence_episode_ids: List[str] = field(default_factory=list)

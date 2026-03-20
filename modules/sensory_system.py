@@ -112,7 +112,7 @@ class SensorySystem:
         raw_name = log.get("user_name", "Unknown")
         
         # [Self-Recognition] 봇 자신의 메시지 처리
-        if self.bot_id and uid == self.bot_id:
+        if log.get("role") == "assistant" or uid in {"bot", "assistant"} or (self.bot_id and uid == self.bot_id):
             role = "assistant"
             user_name = config.BOT_NAME  # 봇의 자아를 강제 주입
         else:

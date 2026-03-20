@@ -1,6 +1,9 @@
 import time
 import numpy as np
 from typing import List, Dict, Any, Tuple
+from memory.canonical_store import CanonicalMemoryStore
+from memory.query_planner import QueryPlanner
+from memory.schema import ContextBundle
 from memory_structures import ClaimNode, RetrievalQuery, EpisodeNode, InsightNode, NoteNode, EntityNode, BaseNode
 from modules.ltm_graph import MemoryGraph
 import config
@@ -16,11 +19,93 @@ class LongTermMemory:
     3. Spreading: 그래프 엣지를 타고 맥락 확장
     4. Reranking: 점수 재조정 (시간, 기분, 키워드)
     """
-    def __init__(self, graph_db: MemoryGraph, api_client):
+    def __init__(self, graph_db: MemoryGraph, api_client, canonical_store: CanonicalMemoryStore = None):
         self.graph = graph_db
         self.api = api_client # (Vector DB 도입 시 사용)
+        self.store = canonical_store
 
     def retrieve(self, query: RetrievalQuery, top_k: int = 5) -> List[BaseNode]:
+        bundle = self.build_context_bundle(query, top_k=top_k)
+        merged: List[BaseNode] = []
+        for group in [
+            bundle.open_loops,
+            bundle.active_claims,
+            bundle.relevant_schedule,
+            bundle.supporting_notes,
+            bundle.supporting_events,
+            bundle.legacy_insights,
+        ]:
+            for node in group:
+                if any(existing.node_id == node.node_id for existing in merged):
+                    continue
+                merged.append(node)
+                if len(merged) >= top_k:
+                    return merged
+        return merged
+
+    def build_context_bundle(self, query: RetrievalQuery, top_k: int = 5) -> ContextBundle:
+        plan = QueryPlanner.plan(query.query_text or " ".join(query.keywords), query.user_id)
+        open_loop_nodes = self._load_open_loop_nodes(query.user_id, query.query_text, limit=3)
+        active_claims = self._load_claim_nodes(query.user_id, plan.requested_facets, query.query_text, limit=top_k)
+        schedule_claims = self._load_claim_nodes(query.user_id, ["schedule.event"], query.query_text, limit=3)
+        interaction_policy = self.store.get_interaction_policy(query.user_id) if self.store else {}
+        relation_state = self.store.get_relation_state(query.user_id) if self.store else None
+
+        graph_nodes = self._retrieve_graph_nodes(query, top_k=max(top_k * 2, 6))
+        supporting_events = [node for node in graph_nodes if isinstance(node, EpisodeNode)][:top_k]
+        supporting_notes = [node for node in graph_nodes if isinstance(node, NoteNode)][:top_k]
+        legacy_insights = [node for node in graph_nodes if isinstance(node, InsightNode)][:max(1, top_k // 2)]
+
+        uncertainties = []
+        if plan.requested_facets and not active_claims and not schedule_claims:
+            uncertainties.append("요청과 관련된 active claim이 없어 추정 없이 답해야 함")
+
+        return ContextBundle(
+            plan=plan,
+            open_loops=open_loop_nodes,
+            active_claims=active_claims,
+            relevant_schedule=schedule_claims,
+            interaction_policy=interaction_policy,
+            relation_state=relation_state,
+            supporting_events=supporting_events,
+            supporting_notes=supporting_notes,
+            legacy_insights=legacy_insights,
+            uncertainties=uncertainties,
+        )
+
+    def _load_open_loop_nodes(self, user_id: str, query_text: str, limit: int) -> List[ClaimNode]:
+        if not self.store:
+            return []
+        loops = self.store.get_open_loops(user_id, search_text=query_text, limit=limit)
+        nodes = []
+        for loop in loops:
+            nodes.append(
+                ClaimNode(
+                    node_id=loop.loop_id,
+                    subject_id=loop.owner_id,
+                    facet="commitment.open_loop",
+                    merge_key=f"{loop.owner_id}|commitment.open_loop|{loop.kind}|{loop.text}",
+                    value={"kind": loop.kind, "text": loop.text, "priority": loop.priority},
+                    qualifiers={},
+                    nl_summary=loop.text,
+                    source_type="explicit",
+                    confidence=1.0,
+                    status="active",
+                    valid_to=loop.due_at,
+                    evidence_episode_ids=loop.evidence_episode_ids,
+                )
+            )
+        return nodes
+
+    def _load_claim_nodes(self, user_id: str, facets: List[str], query_text: str, limit: int) -> List[ClaimNode]:
+        if not self.store:
+            return []
+        claims = self.store.get_active_claims(user_id, facets=facets, search_text=query_text, limit=limit)
+        if claims or not query_text:
+            return claims
+        return self.store.get_active_claims(user_id, facets=facets, search_text="", limit=limit)
+
+    def _retrieve_graph_nodes(self, query: RetrievalQuery, top_k: int = 5) -> List[BaseNode]:
         """
         STM의 쿼리 객체를 받아 가장 적절한 기억 노드들을 반환
         """

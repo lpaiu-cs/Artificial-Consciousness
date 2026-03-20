@@ -4,7 +4,10 @@ from typing import List, Dict, Tuple, Any
 
 # Config & Structs
 import config
-from memory_structures import ClaimNode, RetrievalQuery, MemoryObject, EpisodeNode, InsightNode, NoteNode
+from memory.canonical_store import CanonicalMemoryStore
+from memory.fast_path import FastPathMemoryWriter
+from memory.schema import ContextBundle
+from memory_structures import ClaimNode, RetrievalQuery, RelationState, MemoryObject, EpisodeNode, InsightNode, NoteNode
 
 # Modules
 from api_client import UnifiedAPIClient
@@ -36,25 +39,30 @@ class BotOrchestrator:
     인지 과정(Perception -> Retrieval -> Cognition -> Action)을 조율합니다.
     """
     
-    def __init__(self):
+    def __init__(self, api_client: UnifiedAPIClient = None,
+                 graph_db: MemoryGraph = None,
+                 canonical_store: CanonicalMemoryStore = None):
         # 1. Infrastructure
-        self.api = UnifiedAPIClient()
-        self.ltm_graph = MemoryGraph() # Thread-Safe Graph DB
+        self.api = api_client or UnifiedAPIClient()
+        self.ltm_graph = graph_db or MemoryGraph() # Thread-Safe Graph DB
+        self.canonical_store = canonical_store or CanonicalMemoryStore()
         
         # 2. Functional Modules
-        self.social = SocialManager(self.ltm_graph, self.api) # Social Brain
+        self.social = SocialManager(self.ltm_graph, self.api, self.canonical_store) # Social Brain
         self.sensory = SensorySystem(self.api)                # Eyes & Ears
         self.stm = WorkingMemory()                            # Short-term Memory
-        self.ltm = LongTermMemory(self.ltm_graph, self.api)   # Long-term Memory Retrieval
+        self.ltm = LongTermMemory(self.ltm_graph, self.api, self.canonical_store)   # Long-term Memory Retrieval
+        self.fast_path_writer = FastPathMemoryWriter(self.ltm_graph, self.canonical_store)
         
         # 3. Background Process
-        self.reflector = ReflectionHandler(self.ltm_graph, self.api)
+        self.reflector = ReflectionHandler(self.ltm_graph, self.api, self.canonical_store)
         self.reflector.start_background_loop(
             self.stm.eviction_buffer, interval=config.REFLECTION_INTERVAL
         )
         
         # 4. State
         self.current_mood = "calm"
+        self.session_state = {"current_mood": "calm"}
         # config에 봇 ID가 있으면 가져옴
         self.bot_id = str(getattr(config, 'BOT_USER_ID', ''))
 
@@ -118,6 +126,7 @@ class BotOrchestrator:
         # 닉네임이 바뀌었다면 그래프 갱신 및 시스템 알림 생성 여부 판단
         # (현재 구현상 process_identity는 False만 리턴하지만, 추후 확장 시 여기서 시스템 메시지 추가 가능)
         self.social.process_identity(user_id, nickname)
+        self.fast_path_writer.process(chunks)
         
         return chunks
     
@@ -132,19 +141,20 @@ class BotOrchestrator:
             embedding=query_embedding,
             user_id=user_id,
             keywords=query_text.split(), # 키워드도 여전히 보조적으로 사용
+            query_text=query_text,
             current_mood=self.current_mood
         )
         
         # 2. LTM 검색 (LTM Handler 위임)
-        nodes = self.ltm.retrieve(query, top_k=3)
+        context_bundle = self.ltm.build_context_bundle(query, top_k=3)
         
         # 3. STM Attention (Vector-based)
         # 검색된 내용이 아니라 '현재 쿼리'에 집중하도록 STM 활성도 갱신
         self.stm.update_activations(query_embedding)
         
-        return nodes
+        return context_bundle
 
-    def _think(self, ltm_nodes, current_user_id) -> str:
+    def _think(self, memory_context: ContextBundle, current_user_id) -> str:
         """
         [Cognitive Reconstruction]
         STM과 LTM의 데이터를 LLM이 읽기 쉬운 '자연어 요약'으로 변환합니다.
@@ -154,7 +164,7 @@ class BotOrchestrator:
         stm_context = self.stm.get_chronological_context()
         
         # 2. Fast LLM(System 1)에게 요약 요청
-        return self._run_fast_reconstruction(stm_context, ltm_nodes, current_user_id)
+        return self._run_fast_reconstruction(stm_context, memory_context, current_user_id)
 
     def _act(self, user_id, user_input, context_summary, relationship_desc) -> str:
         """
@@ -169,6 +179,7 @@ class BotOrchestrator:
         # 2. Feedback Loop
         # (A) 기분 업데이트
         self.current_mood = natural_emotion
+        self.session_state["current_mood"] = natural_emotion
         
         # (B) 관계 업데이트 (Social Manager 위임)
         # 봇이 생성한 자기 감정보다, 사용자의 실제 발화를 관계 신호로 사용한다.
@@ -193,7 +204,7 @@ class BotOrchestrator:
     # LLM Wrappers (Prompt Engineering Layer)
     # =========================================================================
     
-    def _run_fast_reconstruction(self, stm_list, ltm_nodes, current_user_id) -> str:
+    def _run_fast_reconstruction(self, stm_list, memory_context: ContextBundle, current_user_id) -> str:
         """
         [System 1: Groq]
         파편화된 기억들을 읽기 쉬운 상황 요약문으로 변환합니다.
@@ -234,23 +245,35 @@ class BotOrchestrator:
 
         # LTM (장기 기억) 렌더링
         ltm_text = ""
-        for node in ltm_nodes:
+        for node in memory_context.open_loops:
+            ltm_text += f"- (Open Loop) {node.nl_summary}\n"
+        for node in memory_context.active_claims:
             if isinstance(node, ClaimNode):
                 ltm_text += f"- (Current State) {node.nl_summary} [{node.facet}]\n"
-            elif isinstance(node, NoteNode):
-                ltm_text += f"- (Note) {node.summary} (태그: {', '.join(node.tags) if node.tags else '없음'})\n"
-            elif isinstance(node, InsightNode):
-                # Insight는 subject(대상)가 누구인지가 중요
-                # node.user_id 같은 필드가 없다면 subject 필드를 활용하거나 연결된 Entity 확인 필요
-                # 여기서는 텍스트 자체를 신뢰
-                ltm_text += f"- (Legacy Fact) {node.summary} (신뢰도: {node.confidence})\n"
-            elif isinstance(node, EpisodeNode):
-                # Episode의 user_id 렌더링
-                if node.user_id == self.bot_id:
-                    name = f"{config.BOT_NAME}(Me)"
-                else:
-                    name = render_id(node.user_id, "Unknown")
-                ltm_text += f"- (Memory) {name}가 말하길: {node.content} (기분: {node.emotion_tag})\n"
+        for node in memory_context.relevant_schedule:
+            ltm_text += f"- (Schedule) {node.nl_summary}\n"
+        for node in memory_context.supporting_notes:
+            ltm_text += f"- (Note) {node.summary} (태그: {', '.join(node.tags) if node.tags else '없음'})\n"
+        for node in memory_context.legacy_insights:
+            ltm_text += f"- (Legacy Fact) {node.summary} (신뢰도: {node.confidence})\n"
+        for node in memory_context.supporting_events:
+            if node.user_id == self.bot_id:
+                name = f"{config.BOT_NAME}(Me)"
+            else:
+                name = render_id(node.user_id, "Unknown")
+            ltm_text += f"- (Memory) {name}가 말하길: {node.content} (기분: {node.emotion_tag})\n"
+
+        relation_state = memory_context.relation_state
+        relation_text = (
+            f"trust={relation_state.trust:.2f}, warmth={relation_state.warmth:.2f}, "
+            f"familiarity={relation_state.familiarity:.2f}, respect={relation_state.respect:.2f}, "
+            f"tension={relation_state.tension:.2f}, reliability={relation_state.reliability:.2f}"
+            if relation_state else "없음"
+        )
+        interaction_policy_lines = "\n".join(
+            f"- {key}: {value}" for key, value in memory_context.interaction_policy.items()
+        ) or "- 없음"
+        uncertainty_lines = "\n".join(f"- {item}" for item in memory_context.uncertainties) or "- 없음"
 
         # --- 3. Call API ---
         system_prompt = (
@@ -260,10 +283,19 @@ class BotOrchestrator:
         )
         
         user_prompt = f"""
-        [Relevant Memories]
+        [Open Loops / Claims]
         {ltm_text}
-        
-        [Current Conversation Flow]
+
+        [Interaction Policy]
+        {interaction_policy_lines}
+
+        [Relation State]
+        {relation_text}
+
+        [Uncertainties]
+        {uncertainty_lines}
+
+        [Relevant Memories]
         {stm_text}
         """
 

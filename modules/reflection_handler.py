@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import List, Dict, Any
 
 import config
+from memory.canonical_store import CanonicalMemoryStore
 from memory.ontology import Facet, FACET_SPECS, get_facet_spec
 from memory_structures import MemoryObject
 from modules.ltm_graph import MemoryGraph
@@ -18,9 +19,11 @@ class ReflectionHandler:
     단순 저장이 아니라, LLM을 통해 '성찰(Reflection)'하여 구조화된 데이터로 변환합니다.
     """
 
-    def __init__(self, graph_db: MemoryGraph, api_client: UnifiedAPIClient):
+    def __init__(self, graph_db: MemoryGraph, api_client: UnifiedAPIClient,
+                 canonical_store: CanonicalMemoryStore = None):
         self.graph = graph_db
         self.api = api_client
+        self.canonical_store = canonical_store
         self.stop_event = threading.Event()
         self.thread = None
         self._pending_memories: List[MemoryObject] = []
@@ -33,7 +36,8 @@ class ReflectionHandler:
 
         def loop():
             while not self.stop_event.is_set():
-                time.sleep(interval)
+                if self.stop_event.wait(interval):
+                    break
                 batch = []
                 if eviction_buffer:
                     batch.extend(eviction_buffer[:])
@@ -178,6 +182,9 @@ class ReflectionHandler:
             scope=claim_payload.get("scope", "user_private"),
             embedding=embedding,
         )
+        if self.canonical_store:
+            self.canonical_store.upsert_claim(claim_node)
+            self.canonical_store.upsert_open_loop_from_claim(claim_node)
 
         self.graph.connect_nodes(claim_node.node_id, episode_node_id, weight=config.EVIDENCE_EDGE_TO_EPISODE)
         self.graph.connect_nodes(episode_node_id, claim_node.node_id, weight=config.EVIDENCE_EDGE_TO_INSIGHT)

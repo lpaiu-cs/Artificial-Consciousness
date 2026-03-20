@@ -1,6 +1,10 @@
 import numpy as np
+import time
 from typing import Dict, Any
 import config
+from memory.canonical_store import CanonicalMemoryStore
+from memory.ontology import Facet
+from memory_structures import RelationState
 from modules.ltm_graph import MemoryGraph
 from api_client import UnifiedAPIClient
 
@@ -11,9 +15,11 @@ class SocialManager:
     감정 벡터 연산을 통해 관계(Affinity)를 동적으로 업데이트합니다.
     닉네임 사칭(Impersonation)을 방지하는 보안 로직이 포함됩니다.
     """
-    def __init__(self, ltm_graph: MemoryGraph, api_client: UnifiedAPIClient):
+    def __init__(self, ltm_graph: MemoryGraph, api_client: UnifiedAPIClient,
+                 canonical_store: CanonicalMemoryStore = None):
         self.graph = ltm_graph
         self.api = api_client
+        self.store = canonical_store
         
         # [Social Logic] 긍정 기준점 벡터 미리 계산 (캐싱)
         # 매번 API를 호출하지 않고, 봇이 켜질 때 한 번만 계산합니다.
@@ -31,10 +37,12 @@ class SocialManager:
         Return: { "nickname": "민초단장", "desc": "Friend (85.0)" }
         """
         node = self.graph.get_or_create_user(user_id, "") # 닉네임 없으면 기존거 유지
+        relation_state = self.store.get_relation_state(user_id) if self.store else None
         return {
             "nickname": node.nickname,
             "affinity": node.affinity,
-            "desc": self._score_to_desc(node.affinity),
+            "desc": self._relation_to_desc(node.affinity, relation_state),
+            "relation_state": relation_state,
             # "history": node.nickname_history # 옵션
         }
 
@@ -64,7 +72,8 @@ class SocialManager:
         
         # 신규 유저 처리
         if not node.nickname:
-            node.nickname = safe_nickname
+            self.graph.get_or_create_user(user_id, safe_nickname)
+            self._write_identity_claim(user_id, safe_nickname)
             return False # 첫 만남은 변경 이벤트가 아님
 
         # 3. 변경 감지 및 이력 기록
@@ -75,7 +84,8 @@ class SocialManager:
             
             # (B) 현재 닉네임 갱신
             old_name = node.nickname
-            node.nickname = safe_nickname
+            self.graph.get_or_create_user(user_id, safe_nickname)
+            self._write_identity_claim(user_id, safe_nickname)
             
             # (C) 로그 출력 (선택 사항)
             print(f"🔄 [Identity] Nickname Changed: {old_name} -> {safe_nickname}")
@@ -101,6 +111,18 @@ class SocialManager:
         
         # 3. 그래프 업데이트
         self.graph.update_affinity(user_id, delta)
+        if self.store:
+            self.store.update_relation_state(
+                user_id,
+                {
+                    "trust": similarity * 0.04,
+                    "warmth": similarity * 0.06,
+                    "familiarity": 0.03,
+                    "respect": similarity * 0.02,
+                    "tension": similarity * -0.05,
+                    "reliability": similarity * 0.03,
+                },
+            )
         
         # Debug
         # print(f"❤️ [Social Update] Sim: {similarity:.2f} -> Delta: {delta:+.2f}")
@@ -112,6 +134,31 @@ class SocialManager:
         if score >= 40: return f"Acquaintance ({score:.1f})"
         if score >= 20: return f"Awkward ({score:.1f})"
         return f"Hostile ({score:.1f})"
+
+    def _relation_to_desc(self, affinity: float, relation_state: RelationState = None) -> str:
+        if not relation_state:
+            return self._score_to_desc(affinity)
+        return (
+            f"trust={relation_state.trust:.2f}, warmth={relation_state.warmth:.2f}, "
+            f"familiarity={relation_state.familiarity:.2f}, respect={relation_state.respect:.2f}, "
+            f"tension={relation_state.tension:.2f}, reliability={relation_state.reliability:.2f}"
+        )
+
+    def _write_identity_claim(self, user_id: str, preferred_name: str):
+        if not self.store or not preferred_name:
+            return
+        claim = self.graph.upsert_claim(
+            subject_id=user_id,
+            facet=Facet.IDENTITY_PREFERRED_NAME.value,
+            value={"name": preferred_name},
+            qualifiers={},
+            nl_summary=f"선호 호칭은 {preferred_name}임",
+            source_type="explicit",
+            confidence=1.0,
+            status="active",
+            last_confirmed_at=time.time(),
+        )
+        self.store.upsert_claim(claim)
 
     def _cosine_similarity(self, vec_a, vec_b) -> float:
         a = np.array(vec_a)
