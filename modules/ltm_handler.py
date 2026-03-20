@@ -1,7 +1,7 @@
 import time
 import numpy as np
 from typing import List, Dict, Any, Tuple
-from memory_structures import RetrievalQuery, EpisodeNode, InsightNode, EntityNode, BaseNode
+from memory_structures import ClaimNode, RetrievalQuery, EpisodeNode, InsightNode, NoteNode, EntityNode, BaseNode
 from modules.ltm_graph import MemoryGraph
 import config
 
@@ -48,7 +48,16 @@ class LongTermMemory:
                 continue
             
             # Insight는 검색 점수 보너스 (지식 우선)
-            weight = config.INSIGHT_BONUS if isinstance(node, InsightNode) else config.EPISODE_BASE_WEIGHT
+            if isinstance(node, ClaimNode):
+                if not self._is_active_claim(node):
+                    continue
+                weight = getattr(config, "CLAIM_BONUS", 1.35)
+            elif isinstance(node, InsightNode):
+                weight = config.INSIGHT_BONUS
+            elif isinstance(node, NoteNode):
+                weight = getattr(config, "NOTE_BASE_WEIGHT", 0.9)
+            else:
+                weight = config.EPISODE_BASE_WEIGHT
             base_score = sim_score * weight
             
             candidates[node.node_id] = {
@@ -81,10 +90,10 @@ class LongTermMemory:
                 reason = "graph_connection"
 
                 # [Logic] 노드 타입별 확산 전략
-                if isinstance(anchor_node, InsightNode) and isinstance(target_node, EpisodeNode):
+                if isinstance(anchor_node, (InsightNode, ClaimNode, NoteNode)) and isinstance(target_node, EpisodeNode):
                     # Insight(성향) -> Episode(증거): 매우 강력한 연결
                     spread_score *= config.INSIGHT_TO_EPISODE_BOOST
-                    reason = "evidence_of_insight"
+                    reason = "evidence_of_state"
                     
                 elif isinstance(anchor_node, EpisodeNode) and isinstance(target_node, EpisodeNode):
                     # Episode -> Episode: 전후 상황
@@ -116,6 +125,8 @@ class LongTermMemory:
             # EntityNode는 검색 결과에서 제외 (보통 대화 맥락엔 필요 없음)
             if isinstance(node, EntityNode):
                 continue
+            if isinstance(node, ClaimNode) and not self._is_active_claim(node):
+                continue
 
             # 1. [Mood Congruence] 기분 일치성
             if isinstance(node, EpisodeNode):
@@ -132,7 +143,7 @@ class LongTermMemory:
                 final_score *= decay
 
             # 3. [Keyword Boost]
-            node_text = getattr(node, 'content', getattr(node, 'summary', ""))
+            node_text = getattr(node, 'content', getattr(node, 'nl_summary', getattr(node, 'summary', "")))
             for kw in query.keywords:
                 if kw in node_text:
                     final_score *= config.KEYWORD_MATCH_BOOST
@@ -144,6 +155,13 @@ class LongTermMemory:
         final_results.sort(key=lambda x: x[0], reverse=True)
         
         return [node for score, node in final_results[:top_k]]
+
+    def _is_active_claim(self, claim: ClaimNode) -> bool:
+        if claim.status != "active":
+            return False
+        if isinstance(claim.valid_to, (int, float)) and claim.valid_to < time.time():
+            return False
+        return True
 
     def _is_accessible(self, node: BaseNode, user_id_str: str, user_node_uuid: str) -> bool:
         """
@@ -158,6 +176,10 @@ class LongTermMemory:
             return node.user_id == user_id_str
 
         # 2. EpisodeNode / InsightNode
+        if isinstance(node, ClaimNode) and node.subject_id == user_id_str:
+            return True
+        if isinstance(node, NoteNode) and user_id_str in node.related_entity_ids:
+            return True
         if hasattr(node, 'user_id') and node.user_id == user_id_str:
             return True # 내가 만든 기억 (Fast Path)
             

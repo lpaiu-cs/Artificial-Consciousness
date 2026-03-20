@@ -4,7 +4,7 @@ from typing import List, Dict, Tuple, Any
 
 # Config & Structs
 import config
-from memory_structures import RetrievalQuery, MemoryObject, EpisodeNode, InsightNode
+from memory_structures import ClaimNode, RetrievalQuery, MemoryObject, EpisodeNode, InsightNode, NoteNode
 
 # Modules
 from api_client import UnifiedAPIClient
@@ -171,9 +171,9 @@ class BotOrchestrator:
         self.current_mood = natural_emotion
         
         # (B) 관계 업데이트 (Social Manager 위임)
-        # 봇이 느낀 감정("싸늘함")을 벡터로 변환해 관계 점수에 반영
-        emotion_vec = self.api.get_embedding(natural_emotion)
-        self.social.calculate_and_update_affinity(user_id, emotion_vec)
+        # 봇이 생성한 자기 감정보다, 사용자의 실제 발화를 관계 신호로 사용한다.
+        interaction_signal_vec = self.api.get_embedding(user_input)
+        self.social.calculate_and_update_affinity(user_id, interaction_signal_vec)
         
         # (C) 자가 기억(Self-Memory) STM 저장. 감정 태그 보존!
         bot_mem = MemoryObject(
@@ -185,6 +185,7 @@ class BotOrchestrator:
             emotion_tag=natural_emotion
         )
         self.stm.inject_memories([bot_mem])
+        self.reflector.submit_memories([bot_mem])
         
         return response_text
 
@@ -234,11 +235,15 @@ class BotOrchestrator:
         # LTM (장기 기억) 렌더링
         ltm_text = ""
         for node in ltm_nodes:
-            if isinstance(node, InsightNode):
+            if isinstance(node, ClaimNode):
+                ltm_text += f"- (Current State) {node.nl_summary} [{node.facet}]\n"
+            elif isinstance(node, NoteNode):
+                ltm_text += f"- (Note) {node.summary} (태그: {', '.join(node.tags) if node.tags else '없음'})\n"
+            elif isinstance(node, InsightNode):
                 # Insight는 subject(대상)가 누구인지가 중요
                 # node.user_id 같은 필드가 없다면 subject 필드를 활용하거나 연결된 Entity 확인 필요
                 # 여기서는 텍스트 자체를 신뢰
-                ltm_text += f"- (Fact) {node.summary} (신뢰도: {node.confidence})\n"
+                ltm_text += f"- (Legacy Fact) {node.summary} (신뢰도: {node.confidence})\n"
             elif isinstance(node, EpisodeNode):
                 # Episode의 user_id 렌더링
                 if node.user_id == self.bot_id:

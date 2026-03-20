@@ -28,6 +28,7 @@ class APILogger:
             self.max_content_length = 500
             self.log_level = "WARNING"
             self.exclude_embedding = True
+            self.include_content = False
             return
             
         self.log_file = log_file or getattr(config, 'API_LOG_FILE', 'api_logs.jsonl')
@@ -35,6 +36,7 @@ class APILogger:
         self.max_content_length = getattr(config, 'API_LOG_MAX_CONTENT_LENGTH', 500)
         self.log_level = getattr(config, 'API_LOG_LEVEL', 'DEBUG')
         self.exclude_embedding = exclude_embedding if exclude_embedding is not None else getattr(config, 'API_LOG_EXCLUDE_EMBEDDING', False)
+        self.include_content = getattr(config, 'API_LOG_INCLUDE_CONTENT', False)
         
     def set_enabled(self, enabled: bool):
         """로깅 on/off 토글"""
@@ -49,6 +51,14 @@ class APILogger:
         if text and len(text) > max_len:
             return text[:max_len] + f"... [{len(text)}자]"
         return text
+
+    def _build_text_meta(self, text: str, preview_len: int = None) -> dict:
+        preview_len = preview_len or self.max_content_length
+        text = text or ""
+        entry = {"length": len(text)}
+        if self.include_content and text:
+            entry["preview"] = text[:preview_len]
+        return entry
     
     def _should_log(self, level: str) -> bool:
         """로그 레벨 체크"""
@@ -75,12 +85,14 @@ class APILogger:
         """임베딩 요청 로그"""
         if self.exclude_embedding:
             return
-        self.log({
+        entry = {
             "type": "EMBEDDING_REQUEST",
             "model": model,
-            "input_text": self._truncate_embedding(text),
             "input_length": len(text) if text else 0
-        }, level="DEBUG")
+        }
+        if self.include_content:
+            entry["input_text"] = self._truncate_embedding(text)
+        self.log(entry, level="DEBUG")
     
     def log_embedding_response(self, text: str, embedding_dim: int, duration_ms: float, success: bool, error: str = None):
         """임베딩 응답 로그"""
@@ -88,11 +100,12 @@ class APILogger:
             return
         entry = {
             "type": "EMBEDDING_RESPONSE",
-            "input_preview": self._truncate_embedding(text, 100),
             "embedding_dim": embedding_dim,
             "duration_ms": round(duration_ms, 2),
             "success": success
         }
+        if self.include_content:
+            entry["input_preview"] = self._truncate_embedding(text, 100)
         if error:
             entry["error"] = str(error)
         self.log(entry, level="INFO" if success else "ERROR")
@@ -103,8 +116,8 @@ class APILogger:
             "type": "CHAT_REQUEST",
             "provider": provider,
             "model": model,
-            "system_prompt": system_prompt or "",
-            "user_prompt": user_prompt or "",
+            "system_prompt": self._build_text_meta(system_prompt),
+            "user_prompt": self._build_text_meta(user_prompt),
             "json_mode": json_mode
         }, level="DEBUG")
     
@@ -115,7 +128,7 @@ class APILogger:
             "type": "CHAT_RESPONSE",
             "provider": provider,
             "model": model,
-            "response": str(response) if response else "",
+            "response": self._build_text_meta(str(response) if response else ""),
             "duration_ms": round(duration_ms, 2),
             "success": success
         }

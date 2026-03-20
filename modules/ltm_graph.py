@@ -3,7 +3,8 @@ import os
 import threading
 import time
 from typing import Dict, Union, Optional, List, Any
-from memory_structures import EpisodeNode, InsightNode, EntityNode
+from memory.ontology import get_facet_spec
+from memory_structures import ClaimNode, EpisodeNode, InsightNode, NoteNode, EntityNode
 import config
 
 class MemoryGraph:
@@ -29,6 +30,8 @@ class MemoryGraph:
         # In-Memory Storage
         self.episodes: Dict[str, EpisodeNode] = {}
         self.insights: Dict[str, InsightNode] = {}
+        self.notes: Dict[str, NoteNode] = {}
+        self.claims: Dict[str, ClaimNode] = {}
         self.entities: Dict[str, EntityNode] = {}
         self._embeddings_cache: Dict[str, list] = {}
         
@@ -75,13 +78,27 @@ class MemoryGraph:
     def add_or_update_insight(self, summary: str, confidence: float = 0.5, 
                               embedding: Optional[list] = None) -> InsightNode:
         with self._lock:
-            node = InsightNode(
-                summary=summary, 
-                confidence=confidence,
-                last_updated=time.time(),
-                embedding=None
-            )
-            self.insights[node.node_id] = node
+            now = time.time()
+            normalized = self._normalize_text(summary)
+            node = None
+            for existing in self.insights.values():
+                if self._normalize_text(existing.summary) == normalized:
+                    node = existing
+                    break
+
+            if node:
+                node.summary = summary
+                node.confidence = max(node.confidence, confidence)
+                node.last_updated = now
+            else:
+                node = InsightNode(
+                    summary=summary,
+                    confidence=confidence,
+                    last_updated=now,
+                    embedding=None
+                )
+                self.insights[node.node_id] = node
+
             if embedding:
                 self._embeddings_cache[node.node_id] = embedding
             
@@ -90,6 +107,127 @@ class MemoryGraph:
             if embedding:
                 self._append_log("UPSERT_EMBEDDING", {"node_id": node.node_id, "vector": embedding})
                 
+            return node
+
+    def add_or_update_note(self, summary: str, note_type: str = "narrative",
+                           tags: Optional[List[str]] = None, confidence: float = 0.5,
+                           related_entity_ids: Optional[List[str]] = None,
+                           evidence_episode_ids: Optional[List[str]] = None,
+                           embedding: Optional[list] = None) -> NoteNode:
+        with self._lock:
+            tags = list(dict.fromkeys(tags or []))
+            related_entity_ids = list(dict.fromkeys(related_entity_ids or []))
+            evidence_episode_ids = list(dict.fromkeys(evidence_episode_ids or []))
+            normalized = self._normalize_text(summary)
+
+            node = None
+            for existing in self.notes.values():
+                if existing.note_type != note_type:
+                    continue
+                if self._normalize_text(existing.summary) == normalized:
+                    node = existing
+                    break
+
+            if node:
+                node.summary = summary
+                node.confidence = max(node.confidence, confidence)
+                node.tags = list(dict.fromkeys(node.tags + tags))
+                node.related_entity_ids = list(dict.fromkeys(node.related_entity_ids + related_entity_ids))
+                node.evidence_episode_ids = list(dict.fromkeys(node.evidence_episode_ids + evidence_episode_ids))
+            else:
+                node = NoteNode(
+                    note_type=note_type,
+                    summary=summary,
+                    tags=tags,
+                    confidence=confidence,
+                    related_entity_ids=related_entity_ids,
+                    evidence_episode_ids=evidence_episode_ids,
+                    embedding=None,
+                )
+                self.notes[node.node_id] = node
+
+            self._append_log("UPSERT_NODE", {"category": "notes", "data": node.to_dict()})
+            if embedding:
+                self._embeddings_cache[node.node_id] = embedding
+                self._append_log("UPSERT_EMBEDDING", {"node_id": node.node_id, "vector": embedding})
+
+            return node
+
+    def upsert_claim(self, subject_id: str, facet: str, value: Optional[Dict[str, Any]] = None,
+                     qualifiers: Optional[Dict[str, Any]] = None, nl_summary: str = "",
+                     source_type: str = "explicit", confidence: float = 0.5,
+                     status: str = "active", valid_from: Optional[float] = None,
+                     valid_to: Optional[float] = None, last_confirmed_at: Optional[float] = None,
+                     evidence_episode_ids: Optional[List[str]] = None,
+                     sensitivity: Optional[str] = None, scope: str = "user_private",
+                     embedding: Optional[list] = None) -> ClaimNode:
+        with self._lock:
+            value = value or {}
+            qualifiers = qualifiers or {}
+            evidence_episode_ids = list(dict.fromkeys(evidence_episode_ids or []))
+            spec = get_facet_spec(facet)
+            merge_key = self._build_claim_merge_key(subject_id, facet, value, qualifiers)
+            now = time.time()
+            effective_last_confirmed = last_confirmed_at if last_confirmed_at is not None else now
+
+            matching = [
+                claim for claim in self.claims.values()
+                if claim.subject_id == subject_id and claim.facet == facet and claim.merge_key == merge_key
+            ]
+            active_matching = [claim for claim in matching if claim.status == "active"]
+
+            if spec.merge_policy == "replace":
+                self._supersede_claims([
+                    claim for claim in self.claims.values()
+                    if claim.subject_id == subject_id and claim.facet == facet and claim.status == "active"
+                    and claim.merge_key != merge_key
+                ])
+            elif spec.merge_policy in {"statusful", "sticky", "hypothesis"}:
+                self._supersede_claims([
+                    claim for claim in active_matching
+                    if claim.merge_key == merge_key and claim.node_id not in {m.node_id for m in active_matching[:1]}
+                ])
+
+            node = active_matching[0] if active_matching else None
+            if node:
+                node.value = self._merge_dict(node.value, value, spec.merge_policy)
+                node.qualifiers = self._merge_dict(node.qualifiers, qualifiers, spec.merge_policy)
+                node.nl_summary = nl_summary or node.nl_summary
+                node.source_type = source_type or node.source_type
+                node.confidence = max(node.confidence, confidence)
+                node.status = status or node.status
+                node.valid_from = valid_from if valid_from is not None else node.valid_from
+                node.valid_to = valid_to if valid_to is not None else node.valid_to
+                node.last_confirmed_at = effective_last_confirmed
+                node.evidence_episode_ids = list(dict.fromkeys(node.evidence_episode_ids + evidence_episode_ids))
+                node.sensitivity = sensitivity or node.sensitivity
+                node.scope = scope or node.scope
+            else:
+                node = ClaimNode(
+                    subject_id=subject_id,
+                    facet=facet,
+                    merge_key=merge_key,
+                    value=value,
+                    qualifiers=qualifiers,
+                    nl_summary=nl_summary,
+                    source_type=source_type,
+                    confidence=confidence,
+                    status=status,
+                    valid_from=valid_from,
+                    valid_to=valid_to,
+                    last_confirmed_at=effective_last_confirmed,
+                    evidence_episode_ids=evidence_episode_ids,
+                    sensitivity=sensitivity or spec.default_sensitivity,
+                    scope=scope,
+                    embedding=None,
+                )
+                self.claims[node.node_id] = node
+
+            self._append_log("UPSERT_NODE", {"category": "claims", "data": node.to_dict()})
+            if embedding:
+                self._embeddings_cache[node.node_id] = embedding
+                self._append_log("UPSERT_EMBEDDING", {"node_id": node.node_id, "vector": embedding})
+
             return node
     
     def get_or_create_user(self, user_id: str, nickname: str) -> EntityNode:
@@ -145,21 +283,77 @@ class MemoryGraph:
             # 로그 기록
             self._append_log("UPSERT_NODE", {"category": "entities", "data": node.to_dict()})
 
-    def get_node(self, node_id: str) -> Union[EpisodeNode, InsightNode, EntityNode, None]:
+    def get_node(self, node_id: str) -> Union[EpisodeNode, InsightNode, NoteNode, ClaimNode, EntityNode, None]:
         with self._lock:
             return self.episodes.get(node_id) or \
                    self.insights.get(node_id) or \
+                   self.notes.get(node_id) or \
+                   self.claims.get(node_id) or \
                    self.entities.get(node_id)
     
     def get_all_nodes(self) -> List[Any]:
         with self._lock:
             all_nodes = []
-            for store in [self.episodes, self.insights, self.entities]:
+            for store in [self.episodes, self.insights, self.notes, self.claims, self.entities]:
                 for node in store.values():
                     # 임베딩 임시 주입 (검색용)
                     node.embedding = self._embeddings_cache.get(node.node_id)
                     all_nodes.append(node)
             return all_nodes
+
+    def _normalize_text(self, text: str) -> str:
+        return " ".join((text or "").strip().lower().split())
+
+    def _normalize_merge_value(self, value: Any) -> str:
+        if isinstance(value, list):
+            return ",".join(sorted(self._normalize_merge_value(item) for item in value))
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        if value is None:
+            return ""
+        return str(value).strip().lower()
+
+    def _build_claim_merge_key(self, subject_id: str, facet: str, value: Dict[str, Any],
+                               qualifiers: Dict[str, Any]) -> str:
+        spec = get_facet_spec(facet)
+        if not spec.key_fields:
+            return f"{subject_id}|{facet}"
+
+        parts = [subject_id, facet]
+        for field in spec.key_fields:
+            field_value = value.get(field)
+            if field_value is None:
+                field_value = qualifiers.get(field)
+            parts.append(f"{field}={self._normalize_merge_value(field_value)}")
+        return "|".join(parts)
+
+    def _merge_dict(self, original: Dict[str, Any], incoming: Dict[str, Any], merge_policy: str) -> Dict[str, Any]:
+        if merge_policy == "set_union":
+            merged = dict(original)
+            for key, value in incoming.items():
+                existing = merged.get(key)
+                if isinstance(existing, list) or isinstance(value, list):
+                    existing_list = existing if isinstance(existing, list) else ([existing] if existing else [])
+                    value_list = value if isinstance(value, list) else ([value] if value else [])
+                    merged[key] = list(dict.fromkeys(existing_list + value_list))
+                elif existing and value and existing != value:
+                    merged[key] = list(dict.fromkeys([existing, value]))
+                elif value is not None:
+                    merged[key] = value
+            return merged
+
+        merged = dict(original)
+        for key, value in incoming.items():
+            if value is not None:
+                merged[key] = value
+        return merged
+
+    def _supersede_claims(self, claims: List[ClaimNode]):
+        for claim in claims:
+            if claim.status == "active":
+                claim.status = "superseded"
+                claim.last_confirmed_at = time.time()
+                self._append_log("UPSERT_NODE", {"category": "claims", "data": claim.to_dict()})
 
     # =================================================================
     # Persistence Engine (Snapshot & Delta)
@@ -235,6 +429,12 @@ class MemoryGraph:
             elif cat == "insights":
                 node = InsightNode(**data)
                 self.insights[node_id] = node
+            elif cat == "notes":
+                node = NoteNode(**data)
+                self.notes[node_id] = node
+            elif cat == "claims":
+                node = ClaimNode(**data)
+                self.claims[node_id] = node
             elif cat == "entities":
                 node = EntityNode(**data)
                 self.entities[node_id] = node
@@ -257,6 +457,8 @@ class MemoryGraph:
         data = {
             "episodes": {k: v.to_dict() for k, v in self.episodes.items()},
             "insights": {k: v.to_dict() for k, v in self.insights.items()},
+            "notes": {k: v.to_dict() for k, v in self.notes.items()},
+            "claims": {k: v.to_dict() for k, v in self.claims.items()},
             "entities": {k: v.to_dict() for k, v in self.entities.items()}
         }
         # 임베딩 필드 제거
@@ -291,6 +493,10 @@ class MemoryGraph:
                     self.episodes[k] = EpisodeNode(**v)
                 for k, v in data.get("insights", {}).items():
                     self.insights[k] = InsightNode(**v)
+                for k, v in data.get("notes", {}).items():
+                    self.notes[k] = NoteNode(**v)
+                for k, v in data.get("claims", {}).items():
+                    self.claims[k] = ClaimNode(**v)
                 for k, v in data.get("entities", {}).items():
                     self.entities[k] = EntityNode(**v)
             except Exception as e:

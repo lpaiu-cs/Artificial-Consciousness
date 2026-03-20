@@ -30,7 +30,9 @@ TIME_DECAY = 2.0
 
 # === LTM Retrieval Weights ===
 # Phase 1: Anchoring (Vector Search)
+CLAIM_BONUS = 1.35           # Claim 노드 검색 시 보너스 가중치
 INSIGHT_BONUS = 1.2          # Insight 노드 검색 시 보너스 가중치
+NOTE_BASE_WEIGHT = 0.9       # Note 노드 기본 가중치
 EPISODE_BASE_WEIGHT = 1.0    # Episode 노드 기본 가중치
 
 # Phase 2: Spreading (Graph Traversal)
@@ -64,8 +66,9 @@ SOCIAL_SENSITIVITY = 5.0
 BOT_NAME = "코봇"
 
 # === API Logging Config ===
-API_LOGGING_ENABLED = True          # API 로깅 on/off (테스트 시 False로 설정)
+API_LOGGING_ENABLED = False         # 민감 데이터가 기본으로 기록되지 않도록 안전 기본값 적용
 API_LOG_FILE = "api_logs.jsonl"     # 로그 파일 경로
-API_LOG_LEVEL = "DEBUG"             # DEBUG: 전체, INFO: 요약만, WARNING: 에러만
+API_LOG_LEVEL = "WARNING"           # WARNING 이상만 기본 기록
+API_LOG_INCLUDE_CONTENT = False     # 기본적으로 프롬프트/응답 원문은 기록하지 않음
 API_LOG_MAX_CONTENT_LENGTH = 500    # 로그에 기록할 최대 콘텐츠 길이 (truncate)
 API_LOG_EXCLUDE_EMBEDDING = False   # Embedding 로그 제외 (True면 채팅만 기록)

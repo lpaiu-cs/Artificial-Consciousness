@@ -66,6 +66,39 @@ class InsightNode(BaseNode):
     last_updated: float = field(default_factory=time.time)
     type: str = "insight"
 
+
+@dataclass
+class NoteNode(BaseNode):
+    """Narrative or impression memory for retrieval, not canonical state."""
+    note_type: str = "narrative"
+    summary: str = ""
+    tags: List[str] = field(default_factory=list)
+    confidence: float = 0.5
+    related_entity_ids: List[str] = field(default_factory=list)
+    evidence_episode_ids: List[str] = field(default_factory=list)
+    type: str = "note"
+
+
+@dataclass
+class ClaimNode(BaseNode):
+    """Current or reviewable state with facet-specific merge rules."""
+    subject_id: str = ""
+    facet: str = ""
+    merge_key: str = ""
+    value: Dict[str, Any] = field(default_factory=dict)
+    qualifiers: Dict[str, Any] = field(default_factory=dict)
+    nl_summary: str = ""
+    source_type: str = "explicit"
+    confidence: float = 0.5
+    status: str = "active"
+    valid_from: Optional[float] = None
+    valid_to: Optional[float] = None
+    last_confirmed_at: Optional[float] = None
+    evidence_episode_ids: List[str] = field(default_factory=list)
+    sensitivity: str = "personal"
+    scope: str = "user_private"
+    type: str = "claim"
+
 @dataclass
 class EntityNode(BaseNode):
     """Tier 3: 인물 및 정체성 정보 (Social Map 대체)"""

@@ -20,14 +20,16 @@ class SensorySystem:
         self.api = api_client
         self.time_threshold = time_threshold
         self.bot_id = str(getattr(config, 'BOT_USER_ID', ''))
+        self._seen_log_keys = set()
 
     def process_input(self, history: List[Dict], current_msg: Dict) -> List[MemoryObject]:
         """
         Input: Raw Logs (History + Current)
         Output: Chunked MemoryObjects (Ready for STM & LTM)
         """
-        # 1. 전체 로그 병합
+        # 1. 전체 로그 병합 후 아직 처리하지 않은 delta만 남김
         raw_logs = history + [current_msg] if current_msg else history
+        raw_logs = self._filter_new_logs(raw_logs)
         if not raw_logs:
             return []
         raw_logs.sort(key=lambda x: x.get("timestamp", 0.0))  # 타임스탬프 기준  정렬
@@ -157,6 +159,26 @@ class SensorySystem:
             else:
                 chunk.embedding = [0.0] * 1536 # Mock size
         return chunks
+
+    def _filter_new_logs(self, logs: List[Dict]) -> List[Dict]:
+        """이전 턴에 이미 처리한 로그는 건너뛰어 history 전체 재주입을 막는다."""
+        delta_logs = []
+        for log in logs:
+            if not self._is_valid_log(log):
+                continue
+
+            key = (
+                str(log.get("user_id", "")),
+                log.get("timestamp", 0.0),
+                log.get("msg", "").strip(),
+            )
+            if key in self._seen_log_keys:
+                continue
+
+            self._seen_log_keys.add(key)
+            delta_logs.append(log)
+
+        return delta_logs
 
     def _extract_mentions(self, text: str) -> List[str]:
         """
