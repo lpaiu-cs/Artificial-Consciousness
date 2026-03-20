@@ -46,6 +46,8 @@ class CanonicalMemoryStore:
                     valid_from REAL,
                     valid_to REAL,
                     last_confirmed_at REAL,
+                    source_type TEXT NOT NULL DEFAULT 'explicit',
+                    evidence_json TEXT NOT NULL DEFAULT '[]',
                     sensitivity TEXT,
                     scope TEXT,
                     nl_summary TEXT,
@@ -82,6 +84,21 @@ class CanonicalMemoryStore:
                 );
                 """
             )
+            self._migrate_claim_columns(conn)
+
+    def _migrate_claim_columns(self, conn: sqlite3.Connection):
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(claims)").fetchall()
+        }
+        if "source_type" not in columns:
+            conn.execute(
+                "ALTER TABLE claims ADD COLUMN source_type TEXT NOT NULL DEFAULT 'explicit'"
+            )
+        if "evidence_json" not in columns:
+            conn.execute(
+                "ALTER TABLE claims ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '[]'"
+            )
 
     def upsert_claim(self, claim: ClaimNode):
         with self._lock, self._connect() as conn:
@@ -90,8 +107,9 @@ class CanonicalMemoryStore:
                 INSERT INTO claims (
                     claim_id, subject_id, facet, merge_key, status, confidence,
                     value_json, qualifiers_json, valid_from, valid_to,
-                    last_confirmed_at, sensitivity, scope, nl_summary, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    last_confirmed_at, source_type, evidence_json,
+                    sensitivity, scope, nl_summary, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(claim_id) DO UPDATE SET
                     subject_id=excluded.subject_id,
                     facet=excluded.facet,
@@ -103,6 +121,8 @@ class CanonicalMemoryStore:
                     valid_from=excluded.valid_from,
                     valid_to=excluded.valid_to,
                     last_confirmed_at=excluded.last_confirmed_at,
+                    source_type=excluded.source_type,
+                    evidence_json=excluded.evidence_json,
                     sensitivity=excluded.sensitivity,
                     scope=excluded.scope,
                     nl_summary=excluded.nl_summary,
@@ -120,6 +140,8 @@ class CanonicalMemoryStore:
                     claim.valid_from,
                     claim.valid_to,
                     claim.last_confirmed_at,
+                    claim.source_type,
+                    json.dumps(claim.evidence_episode_ids, ensure_ascii=False),
                     claim.sensitivity,
                     claim.scope,
                     claim.nl_summary,
@@ -128,7 +150,8 @@ class CanonicalMemoryStore:
             )
 
     def get_active_claims(self, subject_id: str, facets: Optional[Iterable[str]] = None,
-                          search_text: str = "", limit: int = 10) -> List[ClaimNode]:
+                          search_text: str = "", limit: int = 10,
+                          viewer_id: Optional[str] = None) -> List[ClaimNode]:
         with self._lock, self._connect() as conn:
             query = """
                 SELECT *
@@ -155,6 +178,11 @@ class CanonicalMemoryStore:
 
             rows = conn.execute(query, params).fetchall()
             claims = [self._row_to_claim(row) for row in rows]
+            if viewer_id is not None:
+                claims = [
+                    claim for claim in claims
+                    if self._claim_visible_to_viewer(claim, viewer_id)
+                ]
             claims.sort(
                 key=lambda claim: (
                     get_facet_spec(claim.facet).retrieval_priority,
@@ -369,13 +397,13 @@ class CanonicalMemoryStore:
             value=json.loads(row["value_json"]),
             qualifiers=json.loads(row["qualifiers_json"]),
             nl_summary=row["nl_summary"] or "",
-            source_type="explicit",
+            source_type=row["source_type"] or "explicit",
             confidence=row["confidence"],
             status=row["status"],
             valid_from=row["valid_from"],
             valid_to=row["valid_to"],
             last_confirmed_at=row["last_confirmed_at"],
-            evidence_episode_ids=[],
+            evidence_episode_ids=json.loads(row["evidence_json"] or "[]"),
             sensitivity=row["sensitivity"] or "personal",
             scope=row["scope"] or "user_private",
         )
@@ -394,6 +422,10 @@ class CanonicalMemoryStore:
 
     def _tokenize(self, search_text: str) -> List[str]:
         return [token.strip() for token in (search_text or "").split() if token.strip()]
+
+    def _claim_visible_to_viewer(self, claim: ClaimNode, viewer_id: str) -> bool:
+        scope = claim.scope or "user_private"
+        return claim.subject_id == viewer_id or scope == "shared"
 
     def _clamp01(self, value: float) -> float:
         return max(0.0, min(1.0, value))

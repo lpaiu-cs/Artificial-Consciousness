@@ -78,6 +78,10 @@ class BotOrchestrator:
         # -------------------------------------------------------
         # 입력 로그를 청크로 변환하고, 닉네임 변경 등을 감지합니다.
         chunked_memories = self._perceive(history, calling_message)
+        if not chunked_memories:
+            chunked_memories = self._build_fallback_memories(calling_message)
+        if not chunked_memories:
+            return ""
         self.stm.inject_memories(chunked_memories) # STM 주입 (Inject)
         
         # -------------------------------------------------------
@@ -154,6 +158,36 @@ class BotOrchestrator:
         
         return context_bundle
 
+    def _build_fallback_memories(self, current_msg: Dict) -> List[MemoryObject]:
+        """
+        Delta ingest 결과가 비어도 현재 턴을 처리하기 위한 최소 MemoryObject를 생성한다.
+        이미 본 로그의 재저장은 피하고, 현재 응답 생성만 안전하게 이어간다.
+        """
+        if not current_msg:
+            return []
+
+        content = (current_msg.get("msg") or "").strip()
+        if not content:
+            return []
+
+        user_id = str(current_msg.get("user_id", "unknown"))
+        is_assistant = (
+            current_msg.get("role") == "assistant"
+            or user_id in {"bot", "assistant"}
+            or (self.bot_id and user_id == self.bot_id)
+        )
+        memory = MemoryObject(
+            content=content,
+            role="assistant" if is_assistant else "user",
+            user_id=user_id,
+            user_name=config.BOT_NAME if is_assistant else current_msg.get("user_name", "Unknown"),
+            timestamp=current_msg.get("timestamp", time.time()),
+            activation=50.0,
+            related_users=[user_id],
+        )
+        memory.embedding = self.api.get_embedding(content)
+        return [memory]
+
     def _think(self, memory_context: ContextBundle, current_user_id) -> str:
         """
         [Cognitive Reconstruction]
@@ -195,6 +229,7 @@ class BotOrchestrator:
             activation=100.0, # 내 말은 중요하므로 높은 초기값
             emotion_tag=natural_emotion
         )
+        bot_mem.embedding = self.api.get_embedding(response_text) if response_text else [0.0] * 1536
         self.stm.inject_memories([bot_mem])
         self.reflector.submit_memories([bot_mem])
         

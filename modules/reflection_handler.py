@@ -192,9 +192,12 @@ class ReflectionHandler:
         subject_entity = self.graph.get_or_create_user(subject_id, involved_users.get(subject_id, ""))
         self.graph.connect_nodes(claim_node.node_id, subject_entity.node_id, weight=1.2)
 
-        for uid, nickname in involved_users.items():
-            entity_id = self.graph.get_or_create_user(uid, nickname).node_id
-            self.graph.connect_nodes(claim_node.node_id, entity_id, weight=0.6)
+        if claim_node.scope == "shared":
+            for uid, nickname in involved_users.items():
+                if uid == subject_id:
+                    continue
+                entity_id = self.graph.get_or_create_user(uid, nickname).node_id
+                self.graph.connect_nodes(claim_node.node_id, entity_id, weight=0.6)
 
     def _persist_note(self, note_payload: Dict[str, Any], episode_node_id: str,
                       involved_users: Dict[str, str], primary_user_id: str):
@@ -220,7 +223,7 @@ class ReflectionHandler:
         self.graph.connect_nodes(note_node.node_id, episode_node_id, weight=config.EVIDENCE_EDGE_TO_EPISODE)
         self.graph.connect_nodes(episode_node_id, note_node.node_id, weight=config.EVIDENCE_EDGE_TO_INSIGHT)
 
-        for uid in set(related_entity_ids + list(involved_users.keys())):
+        for uid in related_entity_ids:
             entity_id = self.graph.get_or_create_user(uid, involved_users.get(uid, "")).node_id
             self.graph.connect_nodes(note_node.node_id, entity_id, weight=0.8)
 

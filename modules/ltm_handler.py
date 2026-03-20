@@ -100,10 +100,22 @@ class LongTermMemory:
     def _load_claim_nodes(self, user_id: str, facets: List[str], query_text: str, limit: int) -> List[ClaimNode]:
         if not self.store:
             return []
-        claims = self.store.get_active_claims(user_id, facets=facets, search_text=query_text, limit=limit)
+        claims = self.store.get_active_claims(
+            user_id,
+            facets=facets,
+            search_text=query_text,
+            limit=limit,
+            viewer_id=user_id,
+        )
         if claims or not query_text:
             return claims
-        return self.store.get_active_claims(user_id, facets=facets, search_text="", limit=limit)
+        return self.store.get_active_claims(
+            user_id,
+            facets=facets,
+            search_text="",
+            limit=limit,
+            viewer_id=user_id,
+        )
 
     def _retrieve_graph_nodes(self, query: RetrievalQuery, top_k: int = 5) -> List[BaseNode]:
         """
@@ -261,10 +273,14 @@ class LongTermMemory:
             return node.user_id == user_id_str
 
         # 2. EpisodeNode / InsightNode
-        if isinstance(node, ClaimNode) and node.subject_id == user_id_str:
-            return True
-        if isinstance(node, NoteNode) and user_id_str in node.related_entity_ids:
-            return True
+        if isinstance(node, ClaimNode):
+            if node.subject_id == user_id_str:
+                return True
+            return (node.scope or "user_private") == "shared" and user_node_uuid in node.edges
+
+        if isinstance(node, NoteNode):
+            return user_id_str in node.related_entity_ids
+
         if hasattr(node, 'user_id') and node.user_id == user_id_str:
             return True # 내가 만든 기억 (Fast Path)
             
