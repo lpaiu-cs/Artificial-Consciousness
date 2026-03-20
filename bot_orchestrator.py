@@ -72,14 +72,17 @@ class BotOrchestrator:
         외부에서 호출되는 진입점입니다.
         """
         user_id = str(calling_message.get("user_id"))
+        raw_user_input = calling_message.get("msg", "")
+        sanitized_history = [self.fast_path_writer.apply_write_barriers(log) for log in history]
+        sanitized_message = self.fast_path_writer.apply_write_barriers(calling_message)
         
         # -------------------------------------------------------
         # Phase 1: Perception (지각)
         # -------------------------------------------------------
         # 입력 로그를 청크로 변환하고, 닉네임 변경 등을 감지합니다.
-        chunked_memories = self._perceive(history, calling_message)
+        chunked_memories = self._perceive(sanitized_history, sanitized_message)
         if not chunked_memories:
-            chunked_memories = self._build_fallback_memories(calling_message)
+            chunked_memories = self._build_fallback_memories(sanitized_message)
         if not chunked_memories:
             return ""
         self.stm.inject_memories(chunked_memories) # STM 주입 (Inject)
@@ -107,7 +110,7 @@ class BotOrchestrator:
         # -------------------------------------------------------
         # Phase 4: Action (행동 및 학습)
         # -------------------------------------------------------
-        response = self._act(user_id, query_text, context_summary, relationship_desc)
+        response = self._act(user_id, raw_user_input, context_summary, relationship_desc)
         
         return response
 

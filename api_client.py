@@ -2,7 +2,7 @@ import logging
 import json
 import time
 import os
-from typing import List, Any, Union
+from typing import List, Any, Optional, Union
 from datetime import datetime
 
 # 외부 라이브러리
@@ -110,7 +110,8 @@ class APILogger:
             entry["error"] = str(error)
         self.log(entry, level="INFO" if success else "ERROR")
     
-    def log_chat_request(self, provider: str, model: str, system_prompt: str, user_prompt: str, json_mode: bool = False):
+    def log_chat_request(self, provider: str, model: str, system_prompt: str, user_prompt: str,
+                         json_mode: bool = False, response_format: str = None):
         """채팅 요청 로그"""
         self.log({
             "type": "CHAT_REQUEST",
@@ -118,7 +119,8 @@ class APILogger:
             "model": model,
             "system_prompt": self._build_text_meta(system_prompt),
             "user_prompt": self._build_text_meta(user_prompt),
-            "json_mode": json_mode
+            "json_mode": json_mode,
+            "response_format": response_format
         }, level="DEBUG")
     
     def log_chat_response(self, provider: str, model: str, response: str, duration_ms: float, 
@@ -240,50 +242,81 @@ class UnifiedAPIClient:
             logging.error(f"Groq Chat Error: {e}")
             return "(Fast Inference Failed)"
 
-    def chat_slow(self, system_prompt: str, user_prompt: str, json_mode: bool = False) -> Union[str, dict]:
+    def chat_slow(self, system_prompt: str, user_prompt: str, json_mode: bool = False,
+                  json_schema: Optional[dict] = None) -> Union[str, dict]:
         """[System 2] GPT-4o: 고지능 추론"""
         if not self.openai_client:
             return {} if json_mode else "(OpenAI N/A)"
 
         # 로그: 요청
-        self.logger.log_chat_request("OpenAI", config.SMART_MODEL, system_prompt, user_prompt, json_mode)
+        response_format = "json_schema" if json_schema else ("json_object" if json_mode else "text")
+        self.logger.log_chat_request(
+            "OpenAI",
+            config.SMART_MODEL,
+            system_prompt,
+            user_prompt,
+            json_mode or bool(json_schema),
+            response_format=response_format,
+        )
         start_time = time.time()
-        
+
+        base_params = {
+            "model": config.SMART_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.8,
+        }
+
         try:
-            params = {
-                "model": config.SMART_MODEL,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.8,
-            }
-            if json_mode:
+            params = dict(base_params)
+            if json_schema:
+                params["response_format"] = {"type": "json_schema", "json_schema": json_schema}
+            elif json_mode:
                 params["response_format"] = {"type": "json_object"}
 
-            response = self.openai_client.chat.completions.create(**params)
-            content = response.choices[0].message.content
-            
-            # 로그: 성공 응답
-            duration_ms = (time.time() - start_time) * 1000
-            token_usage = None
-            if hasattr(response, 'usage') and response.usage:
-                token_usage = {
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens
-                }
-            
-            result = json.loads(content) if json_mode else content
-            self.logger.log_chat_response("OpenAI", config.SMART_MODEL, content, duration_ms,
-                                          success=True, token_usage=token_usage)
-            
-            return result
-
+            return self._run_chat_completion(params, expect_json=json_mode or bool(json_schema), start_time=start_time)
         except Exception as e:
-            # 로그: 에러
+            if json_schema:
+                logging.warning(f"Structured output fallback to json_object: {e}")
+                try:
+                    params = dict(base_params)
+                    params["response_format"] = {"type": "json_object"}
+                    return self._run_chat_completion(params, expect_json=True, start_time=start_time)
+                except Exception as fallback_error:
+                    duration_ms = (time.time() - start_time) * 1000
+                    self.logger.log_chat_response(
+                        "OpenAI",
+                        config.SMART_MODEL,
+                        None,
+                        duration_ms,
+                        success=False,
+                        error=str(fallback_error),
+                    )
+                    logging.error(f"OpenAI Chat Error: {fallback_error}")
+                    return {}
+
             duration_ms = (time.time() - start_time) * 1000
             self.logger.log_chat_response("OpenAI", config.SMART_MODEL, None, duration_ms,
                                           success=False, error=str(e))
             logging.error(f"OpenAI Chat Error: {e}")
             return {} if json_mode else f"(Smart Inference Failed: {e})"
+
+    def _run_chat_completion(self, params: dict, expect_json: bool, start_time: float) -> Union[str, dict]:
+        response = self.openai_client.chat.completions.create(**params)
+        content = response.choices[0].message.content or ("{}" if expect_json else "")
+
+        duration_ms = (time.time() - start_time) * 1000
+        token_usage = None
+        if hasattr(response, 'usage') and response.usage:
+            token_usage = {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens
+            }
+
+        result = json.loads(content) if expect_json else content
+        self.logger.log_chat_response("OpenAI", config.SMART_MODEL, content, duration_ms,
+                                      success=True, token_usage=token_usage)
+        return result

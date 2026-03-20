@@ -1,4 +1,4 @@
-from typing import List
+from typing import Dict, List, Optional, Sequence
 
 from memory.ontology import Facet
 from memory.schema import QueryPlan
@@ -8,7 +8,8 @@ class QueryPlanner:
     """Lightweight heuristic planner for state-first retrieval."""
 
     @staticmethod
-    def plan(user_input: str, user_id: str) -> QueryPlan:
+    def plan(user_input: str, user_id: str,
+             known_entities: Optional[Sequence[Dict[str, object]]] = None) -> QueryPlan:
         text = (user_input or "").strip().lower()
         requested_facets: List[str] = [
             Facet.COMMITMENT_OPEN_LOOP.value,
@@ -51,10 +52,34 @@ class QueryPlanner:
         elif any(token in text for token in ["내일", "다음 주", "다음달", "마감", "예약"]):
             time_scope["focus"] = "future"
 
+        target_entities = QueryPlanner._resolve_target_entities(user_id, text, known_entities or [])
+        if target_entities != [user_id]:
+            include(Facet.RELATION_TO_ENTITY)
+
         return QueryPlan(
-            target_entities=[user_id],
+            target_entities=target_entities,
             requested_facets=requested_facets,
             time_scope=time_scope,
             need_relation_context=True,
             need_evidence=True,
         )
+
+    @staticmethod
+    def _resolve_target_entities(user_id: str, text: str,
+                                 known_entities: Sequence[Dict[str, object]]) -> List[str]:
+        matched: List[str] = []
+        for entity in known_entities:
+            entity_id = str(entity.get("entity_id", ""))
+            if not entity_id:
+                continue
+            names = entity.get("names", [])
+            if not isinstance(names, list):
+                continue
+            for name in names:
+                normalized_name = str(name or "").strip().lower()
+                if len(normalized_name) < 2:
+                    continue
+                if normalized_name in text and entity_id not in matched:
+                    matched.append(entity_id)
+                    break
+        return matched or [user_id]

@@ -148,6 +148,15 @@ class CanonicalMemoryStore:
                     time.time(),
                 ),
             )
+        self.sync_open_loop_with_claim(claim)
+
+    def sync_open_loop_with_claim(self, claim: ClaimNode) -> Optional[OpenLoop]:
+        if claim.facet != "commitment.open_loop":
+            return None
+        if claim.status == "active":
+            return self.upsert_open_loop_from_claim(claim)
+        self.close_open_loop_for_claim(claim)
+        return None
 
     def get_active_claims(self, subject_id: str, facets: Optional[Iterable[str]] = None,
                           search_text: str = "", limit: int = 10,
@@ -283,6 +292,43 @@ class CanonicalMemoryStore:
             evidence_episode_ids=claim.evidence_episode_ids,
             loop_id=claim.node_id,
         )
+
+    def close_open_loop_for_claim(self, claim: ClaimNode) -> bool:
+        if claim.facet != "commitment.open_loop":
+            return False
+
+        terminal_status = self._loop_status_from_claim(claim)
+        with self._lock, self._connect() as conn:
+            updated = conn.execute(
+                """
+                UPDATE open_loops
+                SET status = ?, updated_at = ?
+                WHERE loop_id = ? AND status = 'open'
+                """,
+                (terminal_status, time.time(), claim.node_id),
+            )
+            if updated.rowcount:
+                return True
+
+            kind = (
+                claim.value.get("kind")
+                or claim.qualifiers.get("kind")
+                or "followup_needed"
+            )
+            text = (
+                claim.value.get("text")
+                or claim.qualifiers.get("text")
+                or claim.nl_summary
+            )
+            updated = conn.execute(
+                """
+                UPDATE open_loops
+                SET status = ?, updated_at = ?
+                WHERE owner_id = ? AND kind = ? AND text = ? AND status = 'open'
+                """,
+                (terminal_status, time.time(), claim.subject_id, kind, text),
+            )
+            return updated.rowcount > 0
 
     def get_open_loops(self, owner_id: str, search_text: str = "", limit: int = 5) -> List[OpenLoop]:
         with self._lock, self._connect() as conn:
@@ -426,6 +472,21 @@ class CanonicalMemoryStore:
     def _claim_visible_to_viewer(self, claim: ClaimNode, viewer_id: str) -> bool:
         scope = claim.scope or "user_private"
         return claim.subject_id == viewer_id or scope == "shared"
+
+    def _loop_status_from_claim(self, claim: ClaimNode) -> str:
+        explicit_status = (
+            claim.value.get("loop_status")
+            or claim.qualifiers.get("loop_status")
+            or claim.value.get("status")
+            or claim.qualifiers.get("status")
+        )
+        if explicit_status in {"open", "done", "abandoned"}:
+            return explicit_status
+        if claim.status == "superseded":
+            return "done"
+        if claim.status in {"retracted", "expired", "uncertain"}:
+            return "abandoned"
+        return "done"
 
     def _clamp01(self, value: float) -> float:
         return max(0.0, min(1.0, value))

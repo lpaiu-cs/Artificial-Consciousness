@@ -1,6 +1,6 @@
 import re
 import time
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from memory.canonical_store import CanonicalMemoryStore
 from memory.ontology import Facet
@@ -14,6 +14,34 @@ class FastPathMemoryWriter:
     def __init__(self, graph: MemoryGraph, canonical_store: CanonicalMemoryStore):
         self.graph = graph
         self.store = canonical_store
+        self._processed_barrier_keys = set()
+
+    def apply_write_barriers(self, log: Optional[Dict]) -> Optional[Dict]:
+        if not log:
+            return log
+
+        role = log.get("role", "user")
+        text = (log.get("msg") or "").strip()
+        if role != "user" or not text:
+            return dict(log)
+
+        barriers = self._detect_boundary_rules(text)
+        if not barriers:
+            return dict(log)
+
+        key = (
+            str(log.get("user_id", "")),
+            log.get("timestamp", 0.0),
+            text,
+        )
+        if key not in self._processed_barrier_keys:
+            self._processed_barrier_keys.add(key)
+            self._save_boundary_claims(str(log.get("user_id", "")), barriers)
+
+        sanitized = dict(log)
+        sanitized["msg"] = self._build_boundary_placeholder(barriers)
+        sanitized["memory_redacted"] = True
+        return sanitized
 
     def process(self, memories: List[MemoryObject]):
         for mem in memories:
@@ -49,28 +77,9 @@ class FastPathMemoryWriter:
             )
 
     def _extract_boundary_rules(self, mem: MemoryObject):
-        text = mem.content
-        if "저장하지 마" in text or "기억하지 마" in text:
-            self._save_claim(
-                subject_id=mem.user_id,
-                facet=Facet.BOUNDARY_RULE.value,
-                value={"kind": "do_not_store_sensitive", "rule": text},
-                qualifiers={},
-                nl_summary="민감한 내용을 저장하지 말라는 경계 요청이 있음",
-                confidence=0.98,
-                sensitivity="high",
-            )
-
-        if "다시 꺼내지 마" in text or "그 얘기 꺼내지 마" in text:
-            self._save_claim(
-                subject_id=mem.user_id,
-                facet=Facet.BOUNDARY_RULE.value,
-                value={"kind": "avoid_topic", "rule": text},
-                qualifiers={},
-                nl_summary="특정 주제를 다시 꺼내지 말라는 경계 요청이 있음",
-                confidence=0.98,
-                sensitivity="high",
-            )
+        barriers = self._detect_boundary_rules(mem.content)
+        if barriers:
+            self._save_boundary_claims(mem.user_id, barriers)
 
     def _extract_identity(self, mem: MemoryObject):
         match = re.search(r"(?:나|저)를?\s*([A-Za-z0-9가-힣_]+)(?:이라고|라고)\s*불러", mem.content)
@@ -92,7 +101,7 @@ class FastPathMemoryWriter:
     def _extract_open_loops(self, mem: MemoryObject):
         text = mem.content
         if "다시 알려줘" in text or "다음에 이어서" in text or "내일 이어서" in text or "이따가 다시" in text:
-            claim = self._save_claim(
+            self._save_claim(
                 subject_id=mem.user_id,
                 facet=Facet.COMMITMENT_OPEN_LOOP.value,
                 value={"kind": "followup_needed", "text": text, "priority": 8},
@@ -100,7 +109,42 @@ class FastPathMemoryWriter:
                 nl_summary="후속 안내나 재개가 필요한 열린 루프가 있음",
                 confidence=0.92,
             )
-            self.store.upsert_open_loop_from_claim(claim)
+
+    def _detect_boundary_rules(self, text: str) -> List[Dict[str, str]]:
+        rules: List[Dict[str, str]] = []
+        if "저장하지 마" in text or "기억하지 마" in text:
+            rules.append({
+                "kind": "do_not_store_sensitive",
+                "summary": "민감한 내용을 저장하지 말라는 경계 요청이 있음",
+                "rule": text,
+            })
+        if "다시 꺼내지 마" in text or "그 얘기 꺼내지 마" in text:
+            rules.append({
+                "kind": "avoid_topic",
+                "summary": "특정 주제를 다시 꺼내지 말라는 경계 요청이 있음",
+                "rule": text,
+            })
+        return rules
+
+    def _save_boundary_claims(self, subject_id: str, barriers: List[Dict[str, str]]):
+        for barrier in barriers:
+            self._save_claim(
+                subject_id=subject_id,
+                facet=Facet.BOUNDARY_RULE.value,
+                value={"kind": barrier["kind"], "rule": barrier["rule"]},
+                qualifiers={},
+                nl_summary=barrier["summary"],
+                confidence=0.98,
+                sensitivity="high",
+            )
+
+    def _build_boundary_placeholder(self, barriers: List[Dict[str, str]]) -> str:
+        kinds = {barrier["kind"] for barrier in barriers}
+        if "do_not_store_sensitive" in kinds and "avoid_topic" in kinds:
+            return "경계 요청이 있었다. 민감한 내용 저장과 재언급을 피해야 한다."
+        if "do_not_store_sensitive" in kinds:
+            return "경계 요청이 있었다. 민감한 내용은 장기 기억에 저장하지 않아야 한다."
+        return "경계 요청이 있었다. 특정 주제는 다시 꺼내지 않아야 한다."
 
     def _save_claim(self, subject_id: str, facet: str, value: dict, qualifiers: dict,
                     nl_summary: str, confidence: float,

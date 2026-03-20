@@ -2,6 +2,7 @@ import json
 import os
 import threading
 import time
+from datetime import datetime
 from typing import Dict, Union, Optional, List, Any
 from memory.ontology import get_facet_spec
 from memory_structures import ClaimNode, EpisodeNode, InsightNode, NoteNode, EntityNode
@@ -169,35 +170,60 @@ class MemoryGraph:
             merge_key = self._build_claim_merge_key(subject_id, facet, value, qualifiers)
             now = time.time()
             effective_last_confirmed = last_confirmed_at if last_confirmed_at is not None else now
+            normalized_valid_from, normalized_valid_to = self._normalize_claim_window(
+                value, qualifiers, valid_from, valid_to
+            )
 
             matching = [
                 claim for claim in self.claims.values()
                 if claim.subject_id == subject_id and claim.facet == facet and claim.merge_key == merge_key
             ]
+            if spec.merge_policy == "interval":
+                matching = self._dedupe_claims(matching + self._find_interval_matches(
+                    subject_id, facet, value, qualifiers, normalized_valid_from, normalized_valid_to
+                ))
+
             active_matching = [claim for claim in matching if claim.status == "active"]
 
-            if spec.merge_policy == "replace":
+            node = self._select_existing_claim(matching, active_matching, spec.merge_policy, status)
+            if spec.merge_policy == "replace" and status == "active":
                 self._supersede_claims([
                     claim for claim in self.claims.values()
                     if claim.subject_id == subject_id and claim.facet == facet and claim.status == "active"
                     and claim.merge_key != merge_key
+                    and (not node or claim.node_id != node.node_id)
                 ])
             elif spec.merge_policy in {"statusful", "sticky", "hypothesis"}:
                 self._supersede_claims([
                     claim for claim in active_matching
-                    if claim.merge_key == merge_key and claim.node_id not in {m.node_id for m in active_matching[:1]}
+                    if node and claim.node_id != node.node_id
+                ])
+            elif spec.merge_policy == "multi_active":
+                self._supersede_claims([
+                    claim for claim in active_matching
+                    if node and claim.node_id != node.node_id
+                ])
+            elif spec.merge_policy == "interval" and status == "active":
+                self._supersede_claims([
+                    claim for claim in active_matching
+                    if node and claim.node_id != node.node_id
                 ])
 
-            node = active_matching[0] if active_matching else None
             if node:
+                node.merge_key = merge_key
                 node.value = self._merge_dict(node.value, value, spec.merge_policy)
                 node.qualifiers = self._merge_dict(node.qualifiers, qualifiers, spec.merge_policy)
                 node.nl_summary = nl_summary or node.nl_summary
                 node.source_type = source_type or node.source_type
                 node.confidence = max(node.confidence, confidence)
                 node.status = status or node.status
-                node.valid_from = valid_from if valid_from is not None else node.valid_from
-                node.valid_to = valid_to if valid_to is not None else node.valid_to
+                if spec.merge_policy == "interval" and status == "active":
+                    node.valid_from = self._merge_interval_start(node.valid_from, normalized_valid_from)
+                    node.valid_to = self._merge_interval_end(node.valid_to, normalized_valid_to)
+                    self._update_interval_payload(node.value, node.valid_from, node.valid_to)
+                else:
+                    node.valid_from = normalized_valid_from if normalized_valid_from is not None else node.valid_from
+                    node.valid_to = normalized_valid_to if normalized_valid_to is not None else node.valid_to
                 node.last_confirmed_at = effective_last_confirmed
                 node.evidence_episode_ids = list(dict.fromkeys(node.evidence_episode_ids + evidence_episode_ids))
                 node.sensitivity = sensitivity or node.sensitivity
@@ -213,14 +239,16 @@ class MemoryGraph:
                     source_type=source_type,
                     confidence=confidence,
                     status=status,
-                    valid_from=valid_from,
-                    valid_to=valid_to,
+                    valid_from=normalized_valid_from,
+                    valid_to=normalized_valid_to,
                     last_confirmed_at=effective_last_confirmed,
                     evidence_episode_ids=evidence_episode_ids,
                     sensitivity=sensitivity or spec.default_sensitivity,
                     scope=scope,
                     embedding=None,
                 )
+                if spec.merge_policy == "interval":
+                    self._update_interval_payload(node.value, node.valid_from, node.valid_to)
                 self.claims[node.node_id] = node
 
             self._append_log("UPSERT_NODE", {"category": "claims", "data": node.to_dict()})
@@ -347,6 +375,106 @@ class MemoryGraph:
             if value is not None:
                 merged[key] = value
         return merged
+
+    def _normalize_claim_window(self, value: Dict[str, Any], qualifiers: Dict[str, Any],
+                                valid_from: Optional[float], valid_to: Optional[float]) -> tuple[Optional[float], Optional[float]]:
+        start = self._coerce_timestamp(
+            valid_from
+            if valid_from is not None else value.get("start_at") or qualifiers.get("start_at")
+        )
+        end = self._coerce_timestamp(
+            valid_to
+            if valid_to is not None else value.get("end_at") or qualifiers.get("end_at")
+        )
+        return start, end
+
+    def _coerce_timestamp(self, raw_value: Any) -> Optional[float]:
+        if raw_value is None or raw_value == "":
+            return None
+        if isinstance(raw_value, (int, float)):
+            return float(raw_value)
+        if isinstance(raw_value, str):
+            try:
+                return datetime.fromisoformat(raw_value.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return None
+        return None
+
+    def _find_interval_matches(self, subject_id: str, facet: str, value: Dict[str, Any],
+                               qualifiers: Dict[str, Any], valid_from: Optional[float],
+                               valid_to: Optional[float]) -> List[ClaimNode]:
+        title = self._normalize_merge_value(value.get("title") or qualifiers.get("title"))
+        if not title:
+            return []
+
+        matches: List[ClaimNode] = []
+        for claim in self.claims.values():
+            if claim.subject_id != subject_id or claim.facet != facet:
+                continue
+            existing_title = self._normalize_merge_value(
+                claim.value.get("title") or claim.qualifiers.get("title")
+            )
+            if existing_title != title:
+                continue
+
+            existing_start, existing_end = self._normalize_claim_window(
+                claim.value, claim.qualifiers, claim.valid_from, claim.valid_to
+            )
+            if self._intervals_overlap(existing_start, existing_end, valid_from, valid_to):
+                matches.append(claim)
+        return matches
+
+    def _intervals_overlap(self, start_a: Optional[float], end_a: Optional[float],
+                           start_b: Optional[float], end_b: Optional[float]) -> bool:
+        if start_a is None or start_b is None:
+            return False
+        resolved_end_a = end_a if end_a is not None else start_a
+        resolved_end_b = end_b if end_b is not None else start_b
+        return start_a <= resolved_end_b and start_b <= resolved_end_a
+
+    def _dedupe_claims(self, claims: List[ClaimNode]) -> List[ClaimNode]:
+        seen = set()
+        result = []
+        for claim in claims:
+            if claim.node_id in seen:
+                continue
+            seen.add(claim.node_id)
+            result.append(claim)
+        return result
+
+    def _select_existing_claim(self, matching: List[ClaimNode], active_matching: List[ClaimNode],
+                               merge_policy: str, incoming_status: str) -> Optional[ClaimNode]:
+        ordered_active = sorted(active_matching, key=self._claim_sort_key, reverse=True)
+        if ordered_active:
+            return ordered_active[0]
+        if merge_policy in {"multi_active", "interval"} or incoming_status != "active":
+            ordered_matching = sorted(matching, key=self._claim_sort_key, reverse=True)
+            if ordered_matching:
+                return ordered_matching[0]
+        return None
+
+    def _claim_sort_key(self, claim: ClaimNode) -> tuple[float, float]:
+        return (claim.last_confirmed_at or 0.0, claim.valid_to or 0.0)
+
+    def _merge_interval_start(self, existing: Optional[float], incoming: Optional[float]) -> Optional[float]:
+        if existing is None:
+            return incoming
+        if incoming is None:
+            return existing
+        return min(existing, incoming)
+
+    def _merge_interval_end(self, existing: Optional[float], incoming: Optional[float]) -> Optional[float]:
+        if existing is None:
+            return incoming
+        if incoming is None:
+            return existing
+        return max(existing, incoming)
+
+    def _update_interval_payload(self, payload: Dict[str, Any], valid_from: Optional[float], valid_to: Optional[float]):
+        if valid_from is not None:
+            payload["start_at"] = valid_from
+        if valid_to is not None:
+            payload["end_at"] = valid_to
 
     def _supersede_claims(self, claims: List[ClaimNode]):
         for claim in claims:

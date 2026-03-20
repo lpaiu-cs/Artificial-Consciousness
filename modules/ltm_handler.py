@@ -44,14 +44,46 @@ class LongTermMemory:
         return merged
 
     def build_context_bundle(self, query: RetrievalQuery, top_k: int = 5) -> ContextBundle:
-        plan = QueryPlanner.plan(query.query_text or " ".join(query.keywords), query.user_id)
-        open_loop_nodes = self._load_open_loop_nodes(query.user_id, query.query_text, limit=3)
-        active_claims = self._load_claim_nodes(query.user_id, plan.requested_facets, query.query_text, limit=top_k)
-        schedule_claims = self._load_claim_nodes(query.user_id, ["schedule.event"], query.query_text, limit=3)
+        query_text = query.query_text or " ".join(query.keywords)
+        plan = QueryPlanner.plan(query_text, query.user_id, known_entities=self._build_known_entities())
+        open_loop_nodes = self._load_open_loop_nodes(query.user_id, query_text, limit=3)
+        boundary_claims = self._load_claim_nodes(
+            query.user_id,
+            ["boundary.rule"],
+            query_text,
+            limit=3,
+            viewer_id=query.user_id,
+        )
+        claim_facets = [
+            facet for facet in plan.requested_facets
+            if facet not in {"commitment.open_loop", "boundary.rule", "schedule.event"}
+        ]
+        target_claims = self._load_claim_nodes_for_entities(
+            query.user_id,
+            plan.target_entities,
+            claim_facets,
+            query_text,
+            limit=top_k,
+        )
+        relation_claims = self._load_relation_claims_for_targets(
+            query.user_id,
+            plan.target_entities,
+            query_text,
+            limit=top_k,
+        )
+        active_claims = self._dedupe_nodes(boundary_claims + relation_claims + target_claims)[:top_k]
+        schedule_claims = self._load_claim_nodes_for_entities(
+            query.user_id,
+            plan.target_entities,
+            ["schedule.event"],
+            query_text,
+            limit=3,
+        )
         interaction_policy = self.store.get_interaction_policy(query.user_id) if self.store else {}
         relation_state = self.store.get_relation_state(query.user_id) if self.store else None
 
         graph_nodes = self._retrieve_graph_nodes(query, top_k=max(top_k * 2, 6))
+        graph_nodes = self._filter_nodes_for_targets(graph_nodes, plan.target_entities)
         supporting_events = [node for node in graph_nodes if isinstance(node, EpisodeNode)][:top_k]
         supporting_notes = [node for node in graph_nodes if isinstance(node, NoteNode)][:top_k]
         legacy_insights = [node for node in graph_nodes if isinstance(node, InsightNode)][:max(1, top_k // 2)]
@@ -97,15 +129,17 @@ class LongTermMemory:
             )
         return nodes
 
-    def _load_claim_nodes(self, user_id: str, facets: List[str], query_text: str, limit: int) -> List[ClaimNode]:
+    def _load_claim_nodes(self, user_id: str, facets: List[str], query_text: str, limit: int,
+                          viewer_id: str = None) -> List[ClaimNode]:
         if not self.store:
             return []
+        viewer_id = viewer_id or user_id
         claims = self.store.get_active_claims(
             user_id,
             facets=facets,
             search_text=query_text,
             limit=limit,
-            viewer_id=user_id,
+            viewer_id=viewer_id,
         )
         if claims or not query_text:
             return claims
@@ -114,8 +148,100 @@ class LongTermMemory:
             facets=facets,
             search_text="",
             limit=limit,
-            viewer_id=user_id,
+            viewer_id=viewer_id,
         )
+
+    def _load_claim_nodes_for_entities(self, viewer_id: str, subject_ids: List[str],
+                                       facets: List[str], query_text: str, limit: int) -> List[ClaimNode]:
+        if not facets:
+            return []
+        nodes: List[ClaimNode] = []
+        for subject_id in subject_ids:
+            nodes.extend(
+                self._load_claim_nodes(
+                    subject_id,
+                    facets,
+                    query_text,
+                    limit=limit,
+                    viewer_id=viewer_id,
+                )
+            )
+        return self._dedupe_nodes(nodes)[:limit]
+
+    def _load_relation_claims_for_targets(self, viewer_id: str, target_entities: List[str],
+                                          query_text: str, limit: int) -> List[ClaimNode]:
+        if not self.store or not target_entities or target_entities == [viewer_id]:
+            return []
+        relation_claims = self._load_claim_nodes(
+            viewer_id,
+            ["relation.to_entity"],
+            query_text,
+            limit=limit,
+            viewer_id=viewer_id,
+        )
+        target_set = set(target_entities)
+        return [
+            claim for claim in relation_claims
+            if str(claim.value.get("target_entity_id")) in target_set
+        ][:limit]
+
+    def _build_known_entities(self) -> List[Dict[str, Any]]:
+        known_entities: List[Dict[str, Any]] = []
+        for entity in self.graph.entities.values():
+            names = []
+            if entity.nickname:
+                names.append(entity.nickname)
+            names.extend(entity.nickname_history)
+            names = list(dict.fromkeys(name for name in names if name))
+            if not names:
+                continue
+            known_entities.append({
+                "entity_id": entity.user_id,
+                "names": names,
+            })
+        return known_entities
+
+    def _filter_nodes_for_targets(self, nodes: List[BaseNode], target_entities: List[str]) -> List[BaseNode]:
+        if not target_entities:
+            return nodes
+
+        target_set = set(target_entities)
+        target_entity_node_ids = {
+            self.graph.get_or_create_user(entity_id, "").node_id
+            for entity_id in target_set
+        }
+        filtered: List[BaseNode] = []
+        for node in nodes:
+            if isinstance(node, ClaimNode):
+                if node.subject_id in target_set:
+                    filtered.append(node)
+                    continue
+                if str(node.value.get("target_entity_id")) in target_set:
+                    filtered.append(node)
+                    continue
+            elif isinstance(node, NoteNode):
+                if target_set.intersection(node.related_entity_ids):
+                    filtered.append(node)
+                    continue
+            elif isinstance(node, EpisodeNode):
+                if node.user_id in target_set or any(entity_node_id in node.edges for entity_node_id in target_entity_node_ids):
+                    filtered.append(node)
+                    continue
+            elif isinstance(node, InsightNode):
+                if any(entity_node_id in node.edges for entity_node_id in target_entity_node_ids):
+                    filtered.append(node)
+                    continue
+        return filtered or nodes
+
+    def _dedupe_nodes(self, nodes: List[BaseNode]) -> List[BaseNode]:
+        deduped: List[BaseNode] = []
+        seen = set()
+        for node in nodes:
+            if node.node_id in seen:
+                continue
+            seen.add(node.node_id)
+            deduped.append(node)
+        return deduped
 
     def _retrieve_graph_nodes(self, query: RetrievalQuery, top_k: int = 5) -> List[BaseNode]:
         """

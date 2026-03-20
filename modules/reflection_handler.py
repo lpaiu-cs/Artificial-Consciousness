@@ -184,7 +184,6 @@ class ReflectionHandler:
         )
         if self.canonical_store:
             self.canonical_store.upsert_claim(claim_node)
-            self.canonical_store.upsert_open_loop_from_claim(claim_node)
 
         self.graph.connect_nodes(claim_node.node_id, episode_node_id, weight=config.EVIDENCE_EDGE_TO_EPISODE)
         self.graph.connect_nodes(episode_node_id, claim_node.node_id, weight=config.EVIDENCE_EDGE_TO_INSIGHT)
@@ -285,14 +284,108 @@ class ReflectionHandler:
         """
 
         try:
-            # chat_slow에 json_mode=True 옵션 사용 권장
-            response = self.api.chat_slow(system_prompt, user_prompt, json_mode=True)
+            schema = self._reflection_output_schema()
+            try:
+                response = self.api.chat_slow(
+                    system_prompt,
+                    user_prompt,
+                    json_mode=True,
+                    json_schema=schema,
+                )
+            except TypeError:
+                response = self.api.chat_slow(system_prompt, user_prompt, json_mode=True)
             if isinstance(response, str):
                  response = json.loads(response)
             return self._normalize_analysis_result(response, memories)
         except Exception as e:
             logging.error(f"Reflection LLM Parsing Error: {e}")
             return {}
+
+    def _reflection_output_schema(self) -> Dict[str, Any]:
+        return {
+            "name": "memory_reflection",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "episode_summary",
+                    "dominant_emotion",
+                    "claims",
+                    "notes",
+                    "insights",
+                ],
+                "properties": {
+                    "episode_summary": {"type": "string"},
+                    "dominant_emotion": {"type": "string"},
+                    "claims": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": [
+                                "subject_id",
+                                "facet",
+                                "value",
+                                "qualifiers",
+                                "source_type",
+                                "confidence",
+                                "status",
+                                "nl_summary",
+                            ],
+                            "properties": {
+                                "subject_id": {"type": "string"},
+                                "facet": {"type": "string"},
+                                "value": {"type": "object", "additionalProperties": True},
+                                "qualifiers": {"type": "object", "additionalProperties": True},
+                                "source_type": {
+                                    "type": "string",
+                                    "enum": ["explicit", "inferred", "assistant_commitment"],
+                                },
+                                "confidence": {"type": "number"},
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["active", "superseded", "retracted", "uncertain", "expired"],
+                                },
+                                "nl_summary": {"type": "string"},
+                                "valid_from": {"type": ["string", "number", "null"]},
+                                "valid_to": {"type": ["string", "number", "null"]},
+                                "sensitivity": {"type": ["string", "null"]},
+                                "scope": {"type": ["string", "null"]},
+                            },
+                        },
+                    },
+                    "notes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": [
+                                "note_type",
+                                "summary",
+                                "tags",
+                                "confidence",
+                                "related_entity_ids",
+                            ],
+                            "properties": {
+                                "note_type": {
+                                    "type": "string",
+                                    "enum": ["narrative", "theme", "inside_joke", "impression", "repair"],
+                                },
+                                "summary": {"type": "string"},
+                                "tags": {"type": "array", "items": {"type": "string"}},
+                                "confidence": {"type": "number"},
+                                "related_entity_ids": {"type": "array", "items": {"type": "string"}},
+                            },
+                        },
+                    },
+                    "insights": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+            },
+        }
 
     def _coerce_timestamp(self, raw_value: Any) -> Any:
         if raw_value is None or raw_value == "":
@@ -326,8 +419,10 @@ class ReflectionHandler:
                 continue
             if not facet:
                 continue
+            subject_id = str(claim.get("subject_id") or primary_user_id)
+            default_scope = "shared" if subject_id != primary_user_id else "user_private"
             normalized["claims"].append({
-                "subject_id": str(claim.get("subject_id") or primary_user_id),
+                "subject_id": subject_id,
                 "facet": facet,
                 "value": claim.get("value") or {},
                 "qualifiers": claim.get("qualifiers") or {},
@@ -338,7 +433,7 @@ class ReflectionHandler:
                 "valid_from": claim.get("valid_from"),
                 "valid_to": claim.get("valid_to"),
                 "sensitivity": claim.get("sensitivity"),
-                "scope": claim.get("scope", "user_private"),
+                "scope": claim.get("scope") or default_scope,
             })
 
         for note in response.get("notes", []):
