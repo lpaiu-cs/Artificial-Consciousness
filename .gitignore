@@ -10,3 +10,8 @@ api_logs.jsonl
 run_tests.py
 pytest.ini
 demo_api_logging.py
+
+# secrets
+.env
+.env.*
+!.env.example
