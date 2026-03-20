@@ -57,6 +57,7 @@ LTM_EMBEDDINGS_PATH = "ltm_embeddings.json"  # 임베딩 벡터 저장소
 CANONICAL_MEMORY_DB_PATH = "memory_state.sqlite3"  # 정본 상태 저장소 (SQLite)
 SENSORY_CURSOR_PATH = "sensory_seen_logs.json"  # delta ingest cursor 저장소
 SENSORY_CURSOR_MAX_ENTRIES = 50000              # durable cursor 최대 유지 개수
+SENSORY_CURSOR_HMAC_KEY = os.getenv("SENSORY_CURSOR_HMAC_KEY", "")  # cursor digest용 선택적 비밀키
 
 # Social Update Config
 # 이 감정과 가까울수록 호감도가 오르고, 멀수록(반대일수록) 호감도가 떨어집니다.

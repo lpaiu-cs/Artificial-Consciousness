@@ -1,4 +1,6 @@
 from typing import List, Dict
+import hashlib
+import hmac
 import os
 import time
 import json
@@ -23,6 +25,7 @@ class SensorySystem:
         self.bot_id = str(getattr(config, 'BOT_USER_ID', ''))
         self.cursor_path = getattr(config, "SENSORY_CURSOR_PATH", "sensory_seen_logs.json")
         self.max_seen_entries = int(getattr(config, "SENSORY_CURSOR_MAX_ENTRIES", 50000))
+        self.cursor_hmac_key = getattr(config, "SENSORY_CURSOR_HMAC_KEY", "")
         self._seen_log_keys: Dict[str, float] = {}
         self._load_cursor()
 
@@ -186,7 +189,11 @@ class SensorySystem:
         return delta_logs
 
     def _make_log_key(self, log: Dict) -> str:
-        return json.dumps(
+        message_id = self._extract_message_id(log)
+        if message_id is not None:
+            return f"msgid:{str(log.get('user_id', ''))}:{message_id}"
+
+        payload = json.dumps(
             [
                 str(log.get("user_id", "")),
                 log.get("timestamp", 0.0),
@@ -194,7 +201,22 @@ class SensorySystem:
             ],
             ensure_ascii=False,
             separators=(",", ":"),
-        )
+        ).encode("utf-8")
+        if self.cursor_hmac_key:
+            digest = hmac.new(
+                self.cursor_hmac_key.encode("utf-8"),
+                payload,
+                hashlib.sha256,
+            ).hexdigest()
+            return f"hmac-sha256:{digest}"
+        return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+    def _extract_message_id(self, log: Dict):
+        for key in ("message_id", "msg_id", "id"):
+            value = log.get(key)
+            if isinstance(value, (str, int, float)) and value != "":
+                return str(value)
+        return None
 
     def _touch_seen_key(self, key: str):
         if key in self._seen_log_keys:

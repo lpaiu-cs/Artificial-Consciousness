@@ -85,6 +85,7 @@ class CanonicalMemoryStore:
                 """
             )
             self._migrate_claim_columns(conn)
+            self._migrate_claim_scopes(conn)
 
     def _migrate_claim_columns(self, conn: sqlite3.Connection):
         columns = {
@@ -100,7 +101,39 @@ class CanonicalMemoryStore:
                 "ALTER TABLE claims ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '[]'"
             )
 
+    def _migrate_claim_scopes(self, conn: sqlite3.Connection):
+        rows = conn.execute(
+            """
+            SELECT claim_id, subject_id, facet, value_json, qualifiers_json, scope
+            FROM claims
+            WHERE scope = 'shared'
+            """
+        ).fetchall()
+        for row in rows:
+            value = json.loads(row["value_json"] or "{}")
+            qualifiers = json.loads(row["qualifiers_json"] or "{}")
+            scope, qualifiers = self._normalize_scope_and_qualifiers(
+                row["subject_id"],
+                row["scope"],
+                value,
+                qualifiers,
+            )
+            conn.execute(
+                "UPDATE claims SET scope = ?, qualifiers_json = ? WHERE claim_id = ?",
+                (
+                    scope,
+                    json.dumps(qualifiers, ensure_ascii=False, sort_keys=True),
+                    row["claim_id"],
+                ),
+            )
+
     def upsert_claim(self, claim: ClaimNode):
+        claim.scope, claim.qualifiers = self._normalize_scope_and_qualifiers(
+            claim.subject_id,
+            claim.scope,
+            claim.value,
+            claim.qualifiers,
+        )
         with self._lock, self._connect() as conn:
             conn.execute(
                 """
@@ -435,13 +468,21 @@ class CanonicalMemoryStore:
         return self.save_relation_state(state)
 
     def _row_to_claim(self, row: sqlite3.Row) -> ClaimNode:
+        value = json.loads(row["value_json"])
+        qualifiers = json.loads(row["qualifiers_json"])
+        scope, qualifiers = self._normalize_scope_and_qualifiers(
+            row["subject_id"],
+            row["scope"] or "user_private",
+            value,
+            qualifiers,
+        )
         return ClaimNode(
             node_id=row["claim_id"],
             subject_id=row["subject_id"],
             facet=row["facet"],
             merge_key=row["merge_key"],
-            value=json.loads(row["value_json"]),
-            qualifiers=json.loads(row["qualifiers_json"]),
+            value=value,
+            qualifiers=qualifiers,
             nl_summary=row["nl_summary"] or "",
             source_type=row["source_type"] or "explicit",
             confidence=row["confidence"],
@@ -451,7 +492,7 @@ class CanonicalMemoryStore:
             last_confirmed_at=row["last_confirmed_at"],
             evidence_episode_ids=json.loads(row["evidence_json"] or "[]"),
             sensitivity=row["sensitivity"] or "personal",
-            scope=row["scope"] or "user_private",
+            scope=scope,
         )
 
     def _row_to_open_loop(self, row: sqlite3.Row) -> OpenLoop:
@@ -473,7 +514,7 @@ class CanonicalMemoryStore:
         scope = claim.scope or "user_private"
         if claim.subject_id == viewer_id:
             return True
-        if scope not in {"participants", "shared"}:
+        if scope != "participants":
             return False
         audience_ids = {
             str(audience_id)
@@ -481,6 +522,26 @@ class CanonicalMemoryStore:
             if audience_id
         }
         return viewer_id in audience_ids
+
+    def _normalize_scope_and_qualifiers(self, subject_id: str, scope: Optional[str],
+                                        value: Dict[str, Any], qualifiers: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+        normalized_scope = "participants" if scope == "shared" else (scope or "user_private")
+        normalized_qualifiers = dict(qualifiers or {})
+        if normalized_scope != "participants":
+            return normalized_scope, normalized_qualifiers
+
+        audience_ids = [
+            str(audience_id)
+            for audience_id in normalized_qualifiers.get("audience_ids", [])
+            if audience_id
+        ]
+        if not audience_ids:
+            audience_ids.append(str(subject_id))
+            target_entity_id = value.get("target_entity_id")
+            if target_entity_id:
+                audience_ids.append(str(target_entity_id))
+        normalized_qualifiers["audience_ids"] = list(dict.fromkeys(audience_ids))
+        return normalized_scope, normalized_qualifiers
 
     def _loop_status_from_claim(self, claim: ClaimNode) -> str:
         explicit_status = (

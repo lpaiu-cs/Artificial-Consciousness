@@ -405,7 +405,7 @@ class LongTermMemory:
             if node.subject_id == user_id_str:
                 return True
             scope = node.scope or "user_private"
-            if scope not in {"participants", "shared"}:
+            if scope != "participants":
                 return False
             audience_ids = {
                 str(audience_id)

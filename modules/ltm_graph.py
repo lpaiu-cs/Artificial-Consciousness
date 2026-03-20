@@ -165,6 +165,8 @@ class MemoryGraph:
         with self._lock:
             value = value or {}
             qualifiers = qualifiers or {}
+            scope = self._normalize_claim_scope(scope)
+            qualifiers = self._normalize_claim_qualifiers(subject_id, value, qualifiers, scope)
             evidence_episode_ids = list(dict.fromkeys(evidence_episode_ids or []))
             spec = get_facet_spec(facet)
             merge_key = self._build_claim_merge_key(subject_id, facet, value, qualifiers)
@@ -483,6 +485,35 @@ class MemoryGraph:
                 claim.last_confirmed_at = time.time()
                 self._append_log("UPSERT_NODE", {"category": "claims", "data": claim.to_dict()})
 
+    def _normalize_claim_scope(self, scope: Optional[str]) -> str:
+        normalized = str(scope or "user_private").strip().lower()
+        if normalized == "shared":
+            return "participants"
+        return normalized or "user_private"
+
+    def _normalize_claim_qualifiers(self, subject_id: str, value: Dict[str, Any],
+                                    qualifiers: Dict[str, Any], scope: str,
+                                    inferred_audience_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        normalized = dict(qualifiers or {})
+        if scope != "participants":
+            return normalized
+
+        audience_ids = [
+            str(audience_id)
+            for audience_id in normalized.get("audience_ids", [])
+            if audience_id
+        ]
+        if not audience_ids:
+            audience_ids.append(str(subject_id))
+            target_entity_id = value.get("target_entity_id")
+            if target_entity_id:
+                audience_ids.append(str(target_entity_id))
+            for audience_id in inferred_audience_ids or []:
+                if audience_id:
+                    audience_ids.append(str(audience_id))
+        normalized["audience_ids"] = list(dict.fromkeys(audience_ids))
+        return normalized
+
     # =================================================================
     # Persistence Engine (Snapshot & Delta)
     # =================================================================
@@ -539,6 +570,7 @@ class MemoryGraph:
                             continue
             except Exception as e:
                 print(f"❌ Log Replay Error: {e}")
+        self._migrate_legacy_claim_scopes()
 
     def _apply_log_entry(self, entry: Dict):
         """로그 한 줄을 메모리에 반영"""
@@ -562,6 +594,7 @@ class MemoryGraph:
                 self.notes[node_id] = node
             elif cat == "claims":
                 node = ClaimNode(**data)
+                node.scope = self._normalize_claim_scope(node.scope)
                 self.claims[node_id] = node
             elif cat == "entities":
                 node = EntityNode(**data)
@@ -624,7 +657,9 @@ class MemoryGraph:
                 for k, v in data.get("notes", {}).items():
                     self.notes[k] = NoteNode(**v)
                 for k, v in data.get("claims", {}).items():
-                    self.claims[k] = ClaimNode(**v)
+                    claim = ClaimNode(**v)
+                    claim.scope = self._normalize_claim_scope(claim.scope)
+                    self.claims[k] = claim
                 for k, v in data.get("entities", {}).items():
                     self.entities[k] = EntityNode(**v)
             except Exception as e:
@@ -636,3 +671,23 @@ class MemoryGraph:
                     self._embeddings_cache = json.load(f)
             except Exception as e:
                 print(f"❌ Embeddings Snapshot Load Error: {e}")
+
+    def _migrate_legacy_claim_scopes(self):
+        entity_ids_by_node = {
+            node_id: entity.user_id
+            for node_id, entity in self.entities.items()
+        }
+        for claim in self.claims.values():
+            inferred_audience_ids = [
+                entity_ids_by_node[edge_id]
+                for edge_id in claim.edges
+                if edge_id in entity_ids_by_node
+            ]
+            claim.scope = self._normalize_claim_scope(claim.scope)
+            claim.qualifiers = self._normalize_claim_qualifiers(
+                claim.subject_id,
+                claim.value,
+                claim.qualifiers,
+                claim.scope,
+                inferred_audience_ids=inferred_audience_ids,
+            )
