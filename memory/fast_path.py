@@ -1,7 +1,10 @@
 import hashlib
+import json
 import re
 import time
 from typing import Dict, List, Optional
+
+import config
 
 from memory.canonical_store import CanonicalMemoryStore
 from memory.ontology import Facet
@@ -15,7 +18,8 @@ class FastPathMemoryWriter:
     def __init__(self, graph: MemoryGraph, canonical_store: CanonicalMemoryStore):
         self.graph = graph
         self.store = canonical_store
-        self._processed_barrier_keys = set()
+        self._processed_barrier_keys: Dict[str, float] = {}
+        self._barrier_dedupe_max_entries = int(getattr(config, "BOUNDARY_DEDUPE_MAX_ENTRIES", 2048))
 
     def apply_write_barriers(self, log: Optional[Dict]) -> Optional[Dict]:
         if not log:
@@ -26,21 +30,23 @@ class FastPathMemoryWriter:
         if role != "user" or not text:
             return dict(log)
 
-        barriers = self._detect_boundary_rules(text)
+        sanitized_text, barriers = self._redact_boundary_segments(text)
         if not barriers:
             return dict(log)
 
-        key = (
+        key = self._make_processed_barrier_key(
             str(log.get("user_id", "")),
             log.get("timestamp", 0.0),
-            text,
+            barriers,
         )
         if key not in self._processed_barrier_keys:
-            self._processed_barrier_keys.add(key)
+            self._touch_processed_barrier_key(key)
             self._save_boundary_claims(str(log.get("user_id", "")), barriers)
+        else:
+            self._touch_processed_barrier_key(key)
 
         sanitized = dict(log)
-        sanitized["msg"] = self._build_boundary_placeholder(barriers)
+        sanitized["msg"] = sanitized_text
         sanitized["memory_redacted"] = True
         return sanitized
 
@@ -131,6 +137,35 @@ class FastPathMemoryWriter:
             })
         return rules
 
+    def _redact_boundary_segments(self, text: str) -> tuple[str, List[Dict[str, str]]]:
+        segments = self._segment_text(text)
+        if not segments:
+            return text, []
+
+        sanitized_segments: List[str] = []
+        all_barriers: List[Dict[str, str]] = []
+        for segment in segments:
+            barriers = self._detect_boundary_rules(segment)
+            if barriers:
+                sanitized_segments.append(self._build_boundary_placeholder(barriers))
+                all_barriers.extend(barriers)
+            else:
+                sanitized_segments.append(segment)
+
+        if not all_barriers:
+            return text, []
+        return " ".join(segment for segment in sanitized_segments if segment).strip(), all_barriers
+
+    def _segment_text(self, text: str) -> List[str]:
+        normalized = " ".join((text or "").strip().split())
+        if not normalized:
+            return []
+        segments = re.split(
+            r"(?:\s*[,:;]\s*|(?<=[.!?])\s+|\s+\b(?:그리고|근데|하지만|다만|또)\b\s+)",
+            normalized,
+        )
+        return [segment.strip() for segment in segments if segment and segment.strip()]
+
     def _save_boundary_claims(self, subject_id: str, barriers: List[Dict[str, str]]):
         for barrier in barriers:
             self._save_claim(
@@ -156,6 +191,37 @@ class FastPathMemoryWriter:
         if "do_not_store_sensitive" in kinds:
             return "경계 요청이 있었다. 민감한 내용은 장기 기억에 저장하지 않아야 한다."
         return "경계 요청이 있었다. 특정 주제는 다시 꺼내지 않아야 한다."
+
+    def _make_processed_barrier_key(self, user_id: str, timestamp: float,
+                                    barriers: List[Dict[str, str]]) -> str:
+        payload = json.dumps(
+            {
+                "user_id": user_id,
+                "timestamp": timestamp,
+                "barriers": sorted(
+                    [
+                        {
+                            "kind": barrier["kind"],
+                            "target": barrier["target"],
+                        }
+                        for barrier in barriers
+                    ],
+                    key=lambda item: (item["kind"], item["target"]),
+                ),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _touch_processed_barrier_key(self, key: str):
+        if key in self._processed_barrier_keys:
+            self._processed_barrier_keys.pop(key, None)
+        self._processed_barrier_keys[key] = time.time()
+        while len(self._processed_barrier_keys) > max(self._barrier_dedupe_max_entries, 0):
+            oldest_key = next(iter(self._processed_barrier_keys))
+            self._processed_barrier_keys.pop(oldest_key, None)
 
     def _classify_boundary_topic(self, text: str) -> str:
         normalized = self._normalize_boundary_text(text)
