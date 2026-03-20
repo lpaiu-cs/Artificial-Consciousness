@@ -61,8 +61,6 @@ class BotOrchestrator:
         )
         
         # 4. State
-        self.current_mood = "calm"
-        self.session_state = {"current_mood": "calm"}
         self.session_states: Dict[str, Dict[str, Any]] = {}
         # config에 봇 ID가 있으면 가져옴
         self.bot_id = str(getattr(config, 'BOT_USER_ID', ''))
@@ -226,12 +224,10 @@ class BotOrchestrator:
         
         # 2. Feedback Loop
         # (A) 현재 사용자 세션 기분 업데이트
-        self.current_mood = natural_emotion
         session_state["current_mood"] = natural_emotion
         session_state["last_user_input"] = user_input
         session_state["last_assistant_response"] = response_text
         session_state["updated_at"] = time.time()
-        self.session_state = session_state
         
         # (B) 관계 업데이트 (Social Manager 위임)
         interaction_signal_vec = self.api.get_embedding(user_input)
@@ -268,7 +264,6 @@ class BotOrchestrator:
                 "updated_at": 0.0,
             },
         )
-        self.session_state = state
         return state
 
     # =========================================================================

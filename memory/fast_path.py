@@ -1,3 +1,4 @@
+import hashlib
 import re
 import time
 from typing import Dict, List, Optional
@@ -112,17 +113,21 @@ class FastPathMemoryWriter:
 
     def _detect_boundary_rules(self, text: str) -> List[Dict[str, str]]:
         rules: List[Dict[str, str]] = []
+        topic_label = self._classify_boundary_topic(text)
+        target = self._boundary_target_hash(text)
         if "저장하지 마" in text or "기억하지 마" in text:
             rules.append({
                 "kind": "do_not_store_sensitive",
-                "summary": "민감한 내용을 저장하지 말라는 경계 요청이 있음",
-                "rule": text,
+                "summary": f"{topic_label} 관련 민감 주제를 저장하지 말라는 경계 요청이 있음",
+                "topic_label": topic_label,
+                "target": target,
             })
         if "다시 꺼내지 마" in text or "그 얘기 꺼내지 마" in text:
             rules.append({
                 "kind": "avoid_topic",
-                "summary": "특정 주제를 다시 꺼내지 말라는 경계 요청이 있음",
-                "rule": text,
+                "summary": f"{topic_label} 관련 주제를 다시 꺼내지 말라는 경계 요청이 있음",
+                "topic_label": topic_label,
+                "target": target,
             })
         return rules
 
@@ -131,8 +136,14 @@ class FastPathMemoryWriter:
             self._save_claim(
                 subject_id=subject_id,
                 facet=Facet.BOUNDARY_RULE.value,
-                value={"kind": barrier["kind"], "rule": barrier["rule"]},
-                qualifiers={},
+                value={
+                    "kind": barrier["kind"],
+                    "target": barrier["target"],
+                    "policy_kind": barrier["kind"],
+                },
+                qualifiers={
+                    "topic_label": barrier["topic_label"],
+                },
                 nl_summary=barrier["summary"],
                 confidence=0.98,
                 sensitivity="high",
@@ -145,6 +156,27 @@ class FastPathMemoryWriter:
         if "do_not_store_sensitive" in kinds:
             return "경계 요청이 있었다. 민감한 내용은 장기 기억에 저장하지 않아야 한다."
         return "경계 요청이 있었다. 특정 주제는 다시 꺼내지 않아야 한다."
+
+    def _classify_boundary_topic(self, text: str) -> str:
+        normalized = self._normalize_boundary_text(text)
+        topic_keywords = {
+            "health": ["건강", "병원", "아프", "치료", "우울", "불안", "진단", "약", "health"],
+            "finance": ["돈", "예산", "카드", "대출", "월세", "연봉", "주식", "빚", "finance"],
+            "relationship": ["연애", "가족", "친구", "부모", "형제", "교수", "동료", "관계", "relationship"],
+            "work_or_study": ["회사", "직장", "업무", "프로젝트", "학교", "시험", "과제", "연구", "work"],
+            "privacy": ["비밀", "개인", "사생활", "프라이버시", "privacy"],
+        }
+        for label, keywords in topic_keywords.items():
+            if any(keyword in normalized for keyword in keywords):
+                return label
+        return "personal"
+
+    def _boundary_target_hash(self, text: str) -> str:
+        normalized = self._normalize_boundary_text(text)
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+    def _normalize_boundary_text(self, text: str) -> str:
+        return " ".join((text or "").strip().lower().split())
 
     def _save_claim(self, subject_id: str, facet: str, value: dict, qualifiers: dict,
                     nl_summary: str, confidence: float,

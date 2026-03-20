@@ -1,4 +1,5 @@
 from typing import List, Dict
+import os
 import time
 import json
 from memory_structures import MemoryObject
@@ -20,7 +21,10 @@ class SensorySystem:
         self.api = api_client
         self.time_threshold = time_threshold
         self.bot_id = str(getattr(config, 'BOT_USER_ID', ''))
-        self._seen_log_keys = set()
+        self.cursor_path = getattr(config, "SENSORY_CURSOR_PATH", "sensory_seen_logs.json")
+        self.max_seen_entries = int(getattr(config, "SENSORY_CURSOR_MAX_ENTRIES", 50000))
+        self._seen_log_keys: Dict[str, float] = {}
+        self._load_cursor()
 
     def process_input(self, history: List[Dict], current_msg: Dict) -> List[MemoryObject]:
         """
@@ -163,22 +167,77 @@ class SensorySystem:
     def _filter_new_logs(self, logs: List[Dict]) -> List[Dict]:
         """이전 턴에 이미 처리한 로그는 건너뛰어 history 전체 재주입을 막는다."""
         delta_logs = []
+        cursor_updated = False
         for log in logs:
             if not self._is_valid_log(log):
                 continue
 
-            key = (
+            key = self._make_log_key(log)
+            if key in self._seen_log_keys:
+                self._touch_seen_key(key)
+                continue
+
+            self._touch_seen_key(key)
+            cursor_updated = True
+            delta_logs.append(log)
+
+        if cursor_updated:
+            self._save_cursor()
+        return delta_logs
+
+    def _make_log_key(self, log: Dict) -> str:
+        return json.dumps(
+            [
                 str(log.get("user_id", "")),
                 log.get("timestamp", 0.0),
                 log.get("msg", "").strip(),
-            )
-            if key in self._seen_log_keys:
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    def _touch_seen_key(self, key: str):
+        if key in self._seen_log_keys:
+            self._seen_log_keys.pop(key, None)
+        self._seen_log_keys[key] = time.time()
+        while len(self._seen_log_keys) > max(self.max_seen_entries, 0):
+            oldest_key = next(iter(self._seen_log_keys))
+            self._seen_log_keys.pop(oldest_key, None)
+
+    def _load_cursor(self):
+        try:
+            if not os.path.exists(self.cursor_path):
+                return
+            with open(self.cursor_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            self._seen_log_keys = {}
+            return
+
+        keys = payload.get("keys", []) if isinstance(payload, dict) else payload
+        if not isinstance(keys, list):
+            self._seen_log_keys = {}
+            return
+
+        self._seen_log_keys = {}
+        for key in keys[-max(self.max_seen_entries, 0):]:
+            if not isinstance(key, str):
                 continue
+            self._seen_log_keys[key] = time.time()
 
-            self._seen_log_keys.add(key)
-            delta_logs.append(log)
-
-        return delta_logs
+    def _save_cursor(self):
+        parent = os.path.dirname(os.path.abspath(self.cursor_path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        payload = {
+            "keys": list(self._seen_log_keys.keys())[-max(self.max_seen_entries, 0):],
+            "updated_at": time.time(),
+        }
+        try:
+            with open(self.cursor_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False)
+        except OSError:
+            return
 
     def _extract_mentions(self, text: str) -> List[str]:
         """

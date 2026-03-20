@@ -471,7 +471,16 @@ class CanonicalMemoryStore:
 
     def _claim_visible_to_viewer(self, claim: ClaimNode, viewer_id: str) -> bool:
         scope = claim.scope or "user_private"
-        return claim.subject_id == viewer_id or scope == "shared"
+        if claim.subject_id == viewer_id:
+            return True
+        if scope not in {"participants", "shared"}:
+            return False
+        audience_ids = {
+            str(audience_id)
+            for audience_id in (claim.qualifiers.get("audience_ids") or [])
+            if audience_id
+        }
+        return viewer_id in audience_ids
 
     def _loop_status_from_claim(self, claim: ClaimNode) -> str:
         explicit_status = (

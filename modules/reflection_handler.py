@@ -157,13 +157,19 @@ class ReflectionHandler:
         if not facet:
             return
 
-        value = claim_payload.get("value") or {}
-        qualifiers = claim_payload.get("qualifiers") or {}
+        value = dict(claim_payload.get("value") or {})
+        qualifiers = dict(claim_payload.get("qualifiers") or {})
         nl_summary = claim_payload.get("nl_summary") or claim_payload.get("summary") or ""
         if not nl_summary:
             return
 
         spec = get_facet_spec(facet)
+        scope = self._normalize_claim_scope(claim_payload.get("scope"), subject_id, primary_user_id)
+        if scope == "participants":
+            qualifiers["audience_ids"] = self._normalize_audience_ids(
+                qualifiers.get("audience_ids"),
+                involved_users.keys(),
+            )
         embedding = self.api.get_embedding(nl_summary)
         claim_node = self.graph.upsert_claim(
             subject_id=subject_id,
@@ -179,7 +185,7 @@ class ReflectionHandler:
             last_confirmed_at=time.time(),
             evidence_episode_ids=[episode_node_id],
             sensitivity=claim_payload.get("sensitivity", spec.default_sensitivity),
-            scope=claim_payload.get("scope", "user_private"),
+            scope=scope,
             embedding=embedding,
         )
         if self.canonical_store:
@@ -191,11 +197,15 @@ class ReflectionHandler:
         subject_entity = self.graph.get_or_create_user(subject_id, involved_users.get(subject_id, ""))
         self.graph.connect_nodes(claim_node.node_id, subject_entity.node_id, weight=1.2)
 
-        if claim_node.scope == "shared":
-            for uid, nickname in involved_users.items():
-                if uid == subject_id:
+        audience_ids = self._normalize_audience_ids(
+            claim_node.qualifiers.get("audience_ids"),
+            involved_users.keys(),
+        )
+        if claim_node.scope == "participants":
+            for uid in audience_ids:
+                if uid == subject_id or uid not in involved_users:
                     continue
-                entity_id = self.graph.get_or_create_user(uid, nickname).node_id
+                entity_id = self.graph.get_or_create_user(uid, involved_users[uid]).node_id
                 self.graph.connect_nodes(claim_node.node_id, entity_id, weight=0.6)
 
     def _persist_note(self, note_payload: Dict[str, Any], episode_node_id: str,
@@ -410,6 +420,7 @@ class ReflectionHandler:
 
         known_ids = {str(mem.user_id) for mem in memories}
         primary_user_id = next((mem.user_id for mem in memories if mem.role == "user"), memories[0].user_id)
+        participant_ids = sorted(known_ids)
 
         for claim in response.get("claims", []):
             if not isinstance(claim, dict):
@@ -420,12 +431,18 @@ class ReflectionHandler:
             if not facet:
                 continue
             subject_id = str(claim.get("subject_id") or primary_user_id)
-            default_scope = "shared" if subject_id != primary_user_id else "user_private"
+            qualifiers = dict(claim.get("qualifiers") or {})
+            scope = self._normalize_claim_scope(claim.get("scope"), subject_id, primary_user_id)
+            if scope == "participants":
+                qualifiers["audience_ids"] = self._normalize_audience_ids(
+                    qualifiers.get("audience_ids"),
+                    participant_ids,
+                )
             normalized["claims"].append({
                 "subject_id": subject_id,
                 "facet": facet,
                 "value": claim.get("value") or {},
-                "qualifiers": claim.get("qualifiers") or {},
+                "qualifiers": qualifiers,
                 "source_type": claim.get("source_type", "explicit"),
                 "confidence": float(claim.get("confidence", 0.8)),
                 "status": claim.get("status", "active"),
@@ -433,7 +450,7 @@ class ReflectionHandler:
                 "valid_from": claim.get("valid_from"),
                 "valid_to": claim.get("valid_to"),
                 "sensitivity": claim.get("sensitivity"),
-                "scope": claim.get("scope") or default_scope,
+                "scope": scope,
             })
 
         for note in response.get("notes", []):
@@ -452,3 +469,25 @@ class ReflectionHandler:
             })
 
         return normalized
+
+    def _normalize_claim_scope(self, raw_scope: Any, subject_id: str, primary_user_id: str) -> str:
+        scope = str(raw_scope or "").strip().lower()
+        if scope == "shared":
+            scope = "participants"
+        if scope in {"participants", "user_private", "session"}:
+            return scope
+        return "participants" if subject_id != primary_user_id else "user_private"
+
+    def _normalize_audience_ids(self, audience_ids: Any, fallback_ids) -> List[str]:
+        allowed_ids = {str(audience_id) for audience_id in fallback_ids if audience_id}
+        if isinstance(audience_ids, list):
+            normalized = [
+                str(audience_id)
+                for audience_id in audience_ids
+                if audience_id and str(audience_id) in allowed_ids
+            ]
+        else:
+            normalized = []
+        if not normalized:
+            normalized = sorted(allowed_ids)
+        return list(dict.fromkeys(normalized))

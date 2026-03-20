@@ -118,7 +118,7 @@ FACET_SPECS: Dict[Facet, FacetSpec] = {
     ),
     Facet.BOUNDARY_RULE: FacetSpec(
         name=Facet.BOUNDARY_RULE.value,
-        key_fields=("kind", "target", "rule"),
+        key_fields=("kind", "target"),
         merge_policy="sticky",
         ttl_policy="persistent",
         promotion_policy="explicit_only",

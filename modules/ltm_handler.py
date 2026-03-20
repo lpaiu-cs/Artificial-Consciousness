@@ -91,6 +91,8 @@ class LongTermMemory:
         uncertainties = []
         if plan.requested_facets and not active_claims and not schedule_claims:
             uncertainties.append("요청과 관련된 active claim이 없어 추정 없이 답해야 함")
+        if plan.target_entities and set(plan.target_entities) != {query.user_id} and not graph_nodes:
+            uncertainties.append("대상 entity와 직접 연결된 evidence가 없어 관련 보조 기억을 비워둠")
 
         return ContextBundle(
             plan=plan,
@@ -231,7 +233,7 @@ class LongTermMemory:
                 if any(entity_node_id in node.edges for entity_node_id in target_entity_node_ids):
                     filtered.append(node)
                     continue
-        return filtered or nodes
+        return filtered
 
     def _dedupe_nodes(self, nodes: List[BaseNode]) -> List[BaseNode]:
         deduped: List[BaseNode] = []
@@ -402,7 +404,15 @@ class LongTermMemory:
         if isinstance(node, ClaimNode):
             if node.subject_id == user_id_str:
                 return True
-            return (node.scope or "user_private") == "shared" and user_node_uuid in node.edges
+            scope = node.scope or "user_private"
+            if scope not in {"participants", "shared"}:
+                return False
+            audience_ids = {
+                str(audience_id)
+                for audience_id in (node.qualifiers.get("audience_ids") or [])
+                if audience_id
+            }
+            return user_id_str in audience_ids and user_node_uuid in node.edges
 
         if isinstance(node, NoteNode):
             return user_id_str in node.related_entity_ids
