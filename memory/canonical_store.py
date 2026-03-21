@@ -4,7 +4,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import config
 from memory.ontology import get_facet_spec
@@ -17,6 +17,7 @@ class CanonicalMemoryStore:
     def __init__(self, db_path: Optional[str] = None):
         self.db_path = db_path or getattr(config, "CANONICAL_MEMORY_DB_PATH", "memory_state.sqlite3")
         self._lock = threading.RLock()
+        self._open_loop_listener: Optional[Callable[[Dict[str, Any]], None]] = None
         self._ensure_parent_dir()
         self._init_db()
 
@@ -64,6 +65,8 @@ class CanonicalMemoryStore:
                     text TEXT NOT NULL,
                     due_at REAL,
                     status TEXT NOT NULL,
+                    source_type TEXT NOT NULL DEFAULT 'explicit',
+                    overdue_notified_at REAL,
                     priority INTEGER NOT NULL,
                     evidence_json TEXT NOT NULL,
                     updated_at REAL NOT NULL
@@ -86,6 +89,10 @@ class CanonicalMemoryStore:
             )
             self._migrate_claim_columns(conn)
             self._migrate_claim_scopes(conn)
+            self._migrate_open_loop_columns(conn)
+
+    def set_open_loop_listener(self, listener: Optional[Callable[[Dict[str, Any]], None]]):
+        self._open_loop_listener = listener
 
     def _migrate_claim_columns(self, conn: sqlite3.Connection):
         columns = {
@@ -125,6 +132,20 @@ class CanonicalMemoryStore:
                     json.dumps(qualifiers, ensure_ascii=False, sort_keys=True),
                     row["claim_id"],
                 ),
+            )
+
+    def _migrate_open_loop_columns(self, conn: sqlite3.Connection):
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(open_loops)").fetchall()
+        }
+        if "source_type" not in columns:
+            conn.execute(
+                "ALTER TABLE open_loops ADD COLUMN source_type TEXT NOT NULL DEFAULT 'explicit'"
+            )
+        if "overdue_notified_at" not in columns:
+            conn.execute(
+                "ALTER TABLE open_loops ADD COLUMN overdue_notified_at REAL"
             )
 
     def upsert_claim(self, claim: ClaimNode):
@@ -238,32 +259,55 @@ class CanonicalMemoryStore:
                          due_at: Optional[float] = None, status: str = "open",
                          priority: int = 0,
                          evidence_episode_ids: Optional[List[str]] = None,
-                         loop_id: Optional[str] = None) -> OpenLoop:
+                         loop_id: Optional[str] = None,
+                         source_type: str = "explicit") -> OpenLoop:
         evidence_episode_ids = list(dict.fromkeys(evidence_episode_ids or []))
+        lifecycle_event: Optional[Dict[str, Any]] = None
         with self._lock, self._connect() as conn:
-            existing = conn.execute(
-                """
-                SELECT *
-                FROM open_loops
-                WHERE owner_id = ? AND kind = ? AND text = ? AND status = 'open'
-                LIMIT 1
-                """,
-                (owner_id, kind, text),
-            ).fetchone()
+            existing = None
+            if loop_id:
+                existing = conn.execute(
+                    """
+                    SELECT *
+                    FROM open_loops
+                    WHERE loop_id = ?
+                    LIMIT 1
+                    """,
+                    (loop_id,),
+                ).fetchone()
+            if not existing:
+                existing = conn.execute(
+                    """
+                    SELECT *
+                    FROM open_loops
+                    WHERE owner_id = ? AND kind = ? AND text = ?
+                    ORDER BY CASE WHEN status = 'open' THEN 0 ELSE 1 END, updated_at DESC
+                    LIMIT 1
+                    """,
+                    (owner_id, kind, text),
+                ).fetchone()
 
             loop_id = existing["loop_id"] if existing else (loop_id or str(uuid.uuid4()))
             updated_at = time.time()
+            overdue_notified_at = existing["overdue_notified_at"] if existing else None
+            created = existing is None
+            reopened = bool(existing and existing["status"] != "open" and status == "open")
+            if status == "open" and (created or reopened):
+                overdue_notified_at = None
             conn.execute(
                 """
                 INSERT INTO open_loops (
-                    loop_id, owner_id, kind, text, due_at, status, priority, evidence_json, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    loop_id, owner_id, kind, text, due_at, status, source_type,
+                    overdue_notified_at, priority, evidence_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(loop_id) DO UPDATE SET
                     owner_id=excluded.owner_id,
                     kind=excluded.kind,
                     text=excluded.text,
                     due_at=excluded.due_at,
                     status=excluded.status,
+                    source_type=excluded.source_type,
+                    overdue_notified_at=excluded.overdue_notified_at,
                     priority=excluded.priority,
                     evidence_json=excluded.evidence_json,
                     updated_at=excluded.updated_at
@@ -275,13 +319,28 @@ class CanonicalMemoryStore:
                     text,
                     due_at,
                     status,
+                    source_type,
+                    overdue_notified_at,
                     priority,
                     json.dumps(evidence_episode_ids, ensure_ascii=False),
                     updated_at,
                 ),
             )
+            if created or reopened:
+                lifecycle_event = {
+                    "event_type": "reopened" if reopened else "opened",
+                    "owner_id": owner_id,
+                    "kind": kind,
+                    "text": text,
+                    "due_at": due_at,
+                    "source_type": source_type,
+                    "occurred_at": updated_at,
+                }
 
-            return OpenLoop(
+        if lifecycle_event:
+            self._emit_open_loop_event(lifecycle_event)
+
+        return OpenLoop(
                 loop_id=loop_id,
                 owner_id=owner_id,
                 kind=kind,
@@ -324,6 +383,7 @@ class CanonicalMemoryStore:
             priority=priority,
             evidence_episode_ids=claim.evidence_episode_ids,
             loop_id=claim.node_id,
+            source_type=claim.source_type or "explicit",
         )
 
     def close_open_loop_for_claim(self, claim: ClaimNode) -> bool:
@@ -331,18 +391,18 @@ class CanonicalMemoryStore:
             return False
 
         terminal_status = self._loop_status_from_claim(claim)
+        lifecycle_event: Optional[Dict[str, Any]] = None
         with self._lock, self._connect() as conn:
-            updated = conn.execute(
+            now = time.time()
+            target_row = conn.execute(
                 """
-                UPDATE open_loops
-                SET status = ?, updated_at = ?
+                SELECT *
+                FROM open_loops
                 WHERE loop_id = ? AND status = 'open'
+                LIMIT 1
                 """,
-                (terminal_status, time.time(), claim.node_id),
-            )
-            if updated.rowcount:
-                return True
-
+                (claim.node_id,),
+            ).fetchone()
             kind = (
                 claim.value.get("kind")
                 or claim.qualifiers.get("kind")
@@ -353,18 +413,56 @@ class CanonicalMemoryStore:
                 or claim.qualifiers.get("text")
                 or claim.nl_summary
             )
+            if not target_row:
+                target_row = conn.execute(
+                    """
+                    SELECT *
+                    FROM open_loops
+                    WHERE owner_id = ? AND kind = ? AND text = ? AND status = 'open'
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """,
+                    (claim.subject_id, kind, text),
+                ).fetchone()
+            if not target_row:
+                return False
+
             updated = conn.execute(
                 """
                 UPDATE open_loops
                 SET status = ?, updated_at = ?
-                WHERE owner_id = ? AND kind = ? AND text = ? AND status = 'open'
+                WHERE loop_id = ? AND status = 'open'
                 """,
-                (terminal_status, time.time(), claim.subject_id, kind, text),
+                (terminal_status, now, target_row["loop_id"]),
             )
-            return updated.rowcount > 0
+            if updated.rowcount:
+                lifecycle_event = {
+                    "event_type": "closed",
+                    "owner_id": target_row["owner_id"],
+                    "kind": target_row["kind"],
+                    "text": target_row["text"],
+                    "due_at": target_row["due_at"],
+                    "source_type": target_row["source_type"] or claim.source_type or "explicit",
+                    "occurred_at": now,
+                    "terminal_status": terminal_status,
+                    "was_overdue": bool(
+                        target_row["overdue_notified_at"] is not None
+                        or (
+                            target_row["due_at"] is not None
+                            and float(target_row["due_at"]) < now
+                        )
+                    ),
+                }
+
+        if lifecycle_event:
+            self._emit_open_loop_event(lifecycle_event)
+            return True
+        return False
 
     def get_open_loops(self, owner_id: str, search_text: str = "", limit: int = 5) -> List[OpenLoop]:
+        lifecycle_events: List[Dict[str, Any]] = []
         with self._lock, self._connect() as conn:
+            lifecycle_events = self._mark_overdue_open_loops_locked(conn, owner_id)
             query = """
                 SELECT *
                 FROM open_loops
@@ -379,7 +477,11 @@ class CanonicalMemoryStore:
             query += " ORDER BY priority DESC, COALESCE(due_at, 9999999999) ASC, updated_at DESC LIMIT ?"
             params.append(limit)
             rows = conn.execute(query, params).fetchall()
-            return [self._row_to_open_loop(row) for row in rows]
+            loops = [self._row_to_open_loop(row) for row in rows]
+
+        for event in lifecycle_events:
+            self._emit_open_loop_event(event)
+        return loops
 
     def get_interaction_policy(self, subject_id: str) -> Dict[str, Any]:
         policy: Dict[str, Any] = {}
@@ -507,6 +609,44 @@ class CanonicalMemoryStore:
             evidence_episode_ids=json.loads(row["evidence_json"] or "[]"),
         )
 
+    def _mark_overdue_open_loops_locked(self, conn: sqlite3.Connection, owner_id: str) -> List[Dict[str, Any]]:
+        now = time.time()
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM open_loops
+            WHERE owner_id = ?
+              AND status = 'open'
+              AND due_at IS NOT NULL
+              AND due_at < ?
+              AND overdue_notified_at IS NULL
+            """,
+            (owner_id, now),
+        ).fetchall()
+        if not rows:
+            return []
+
+        conn.executemany(
+            """
+            UPDATE open_loops
+            SET overdue_notified_at = ?, updated_at = ?
+            WHERE loop_id = ?
+            """,
+            [(now, now, row["loop_id"]) for row in rows],
+        )
+        return [
+            {
+                "event_type": "overdue",
+                "owner_id": row["owner_id"],
+                "kind": row["kind"],
+                "text": row["text"],
+                "due_at": row["due_at"],
+                "source_type": row["source_type"] or "explicit",
+                "occurred_at": now,
+            }
+            for row in rows
+        ]
+
     def _tokenize(self, search_text: str) -> List[str]:
         return [token.strip() for token in (search_text or "").split() if token.strip()]
 
@@ -560,3 +700,11 @@ class CanonicalMemoryStore:
 
     def _clamp01(self, value: float) -> float:
         return max(0.0, min(1.0, value))
+
+    def _emit_open_loop_event(self, event: Dict[str, Any]):
+        if not self._open_loop_listener:
+            return
+        try:
+            self._open_loop_listener(event)
+        except Exception as exc:
+            print(f"⚠️ Open loop listener error: {exc}")

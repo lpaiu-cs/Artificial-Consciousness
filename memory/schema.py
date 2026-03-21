@@ -8,6 +8,8 @@ from memory_structures import ClaimNode, EpisodeNode, InsightNode, NoteNode, Rel
 class QueryPlan:
     target_entities: List[str]
     requested_facets: List[str]
+    entity_hints: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    unresolved_references: List[str] = field(default_factory=list)
     time_scope: Dict[str, Any] = field(default_factory=dict)
     need_relation_context: bool = True
     need_evidence: bool = True

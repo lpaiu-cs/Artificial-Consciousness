@@ -53,6 +53,7 @@ class BotOrchestrator:
         self.stm = WorkingMemory()                            # Short-term Memory
         self.ltm = LongTermMemory(self.ltm_graph, self.api, self.canonical_store)   # Long-term Memory Retrieval
         self.fast_path_writer = FastPathMemoryWriter(self.ltm_graph, self.canonical_store)
+        self.canonical_store.set_open_loop_listener(self.social.handle_open_loop_event)
         
         # 3. Background Process
         self.reflector = ReflectionHandler(self.ltm_graph, self.api, self.canonical_store)
@@ -97,7 +98,7 @@ class BotOrchestrator:
         query_text = last_chunk.content
         
         # LTM 검색 (3-Tier Graph Search)
-        retrieved_nodes = self._retrieve_and_attend(query_text, user_id, session_state["current_mood"])
+        retrieved_nodes = self._retrieve_and_attend(query_text, user_id, session_state)
         
         # -------------------------------------------------------
         # Phase 3: Cognition (사고 및 맥락 구성)
@@ -147,7 +148,7 @@ class BotOrchestrator:
         
         return chunks
     
-    def _retrieve_and_attend(self, query_text: str, user_id: str, current_mood: str):
+    def _retrieve_and_attend(self, query_text: str, user_id: str, session_state: Dict[str, Any]):
         """
         [Memory Retrieval]
         Vector Search -> Graph Spreading -> Semantic Attention
@@ -159,11 +160,16 @@ class BotOrchestrator:
             user_id=user_id,
             keywords=query_text.split(), # 키워드도 여전히 보조적으로 사용
             query_text=query_text,
-            current_mood=current_mood
+            current_mood=session_state["current_mood"]
         )
         
         # 2. LTM 검색 (LTM Handler 위임)
-        context_bundle = self.ltm.build_context_bundle(query, top_k=3)
+        context_bundle = self.ltm.build_context_bundle(
+            query,
+            top_k=3,
+            session_referents=session_state.get("referent_cache", []),
+        )
+        self._update_session_referents(user_id, session_state, context_bundle)
         
         # 3. STM Attention (Vector-based)
         # 검색된 내용이 아니라 '현재 쿼리'에 집중하도록 STM 활성도 갱신
@@ -271,10 +277,41 @@ class BotOrchestrator:
                 "last_user_input": "",
                 "last_assistant_response": "",
                 "last_assistant_memory_text": "",
+                "referent_cache": [],
+                "last_unresolved_references": [],
                 "updated_at": 0.0,
             },
         )
         return state
+
+    def _update_session_referents(self, user_id: str, session_state: Dict[str, Any],
+                                  context_bundle: ContextBundle):
+        referent_cache = [
+            dict(entry)
+            for entry in (session_state.get("referent_cache") or [])
+            if str(entry.get("entity_id", "")) and str(entry.get("entity_id")) != str(user_id)
+        ]
+        max_entries = int(getattr(config, "REFERENT_CACHE_MAX_ENTRIES", 6))
+        now = time.time()
+
+        for entity_id in reversed(context_bundle.plan.target_entities):
+            if str(entity_id) == str(user_id):
+                continue
+            hint = context_bundle.plan.entity_hints.get(str(entity_id), {})
+            entry = {
+                "entity_id": str(entity_id),
+                "names": list(dict.fromkeys(hint.get("names", []))),
+                "roles": list(dict.fromkeys(hint.get("roles", []))),
+                "last_seen": now,
+            }
+            referent_cache = [
+                cached for cached in referent_cache
+                if str(cached.get("entity_id", "")) != str(entity_id)
+            ]
+            referent_cache.insert(0, entry)
+
+        session_state["referent_cache"] = referent_cache[:max(max_entries, 0)]
+        session_state["last_unresolved_references"] = list(context_bundle.plan.unresolved_references)
 
     # =========================================================================
     # LLM Wrappers (Prompt Engineering Layer)

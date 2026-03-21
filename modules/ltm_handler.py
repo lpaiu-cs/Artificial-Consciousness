@@ -1,6 +1,6 @@
 import time
 import numpy as np
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from memory.canonical_store import CanonicalMemoryStore
 from memory.query_planner import QueryPlanner
 from memory.schema import ContextBundle
@@ -43,9 +43,15 @@ class LongTermMemory:
                     return merged
         return merged
 
-    def build_context_bundle(self, query: RetrievalQuery, top_k: int = 5) -> ContextBundle:
+    def build_context_bundle(self, query: RetrievalQuery, top_k: int = 5,
+                             session_referents: Optional[List[Dict[str, Any]]] = None) -> ContextBundle:
         query_text = query.query_text or " ".join(query.keywords)
-        plan = QueryPlanner.plan(query_text, query.user_id, known_entities=self._build_known_entities())
+        plan = QueryPlanner.plan(
+            query_text,
+            query.user_id,
+            known_entities=self._build_known_entities(query.user_id),
+            session_referents=session_referents or [],
+        )
         open_loop_nodes = self._load_open_loop_nodes(query.user_id, query_text, limit=3)
         boundary_claims = self._load_claim_nodes(
             query.user_id,
@@ -82,13 +88,16 @@ class LongTermMemory:
         interaction_policy = self.store.get_interaction_policy(query.user_id) if self.store else {}
         relation_state = self.store.get_relation_state(query.user_id) if self.store else None
 
-        graph_nodes = self._retrieve_graph_nodes(query, top_k=max(top_k * 2, 6))
-        graph_nodes = self._filter_nodes_for_targets(graph_nodes, plan.target_entities)
+        if plan.unresolved_references:
+            graph_nodes = []
+        else:
+            graph_nodes = self._retrieve_graph_nodes(query, top_k=max(top_k * 2, 6))
+            graph_nodes = self._filter_nodes_for_targets(graph_nodes, plan.target_entities)
         supporting_events = [node for node in graph_nodes if isinstance(node, EpisodeNode)][:top_k]
         supporting_notes = [node for node in graph_nodes if isinstance(node, NoteNode)][:top_k]
         legacy_insights = [node for node in graph_nodes if isinstance(node, InsightNode)][:max(1, top_k // 2)]
 
-        uncertainties = []
+        uncertainties = list(plan.unresolved_references)
         if plan.requested_facets and not active_claims and not schedule_claims:
             uncertainties.append("요청과 관련된 active claim이 없어 추정 없이 답해야 함")
         if plan.target_entities and set(plan.target_entities) != {query.user_id} and not graph_nodes:
@@ -187,21 +196,42 @@ class LongTermMemory:
             if str(claim.value.get("target_entity_id")) in target_set
         ][:limit]
 
-    def _build_known_entities(self) -> List[Dict[str, Any]]:
-        known_entities: List[Dict[str, Any]] = []
+    def _build_known_entities(self, viewer_id: str) -> List[Dict[str, Any]]:
+        known_entities: Dict[str, Dict[str, Any]] = {}
         for entity in self.graph.entities.values():
             names = []
             if entity.nickname:
                 names.append(entity.nickname)
             names.extend(entity.nickname_history)
             names = list(dict.fromkeys(name for name in names if name))
-            if not names:
-                continue
-            known_entities.append({
-                "entity_id": entity.user_id,
-                "names": names,
-            })
-        return known_entities
+            entry = known_entities.setdefault(
+                entity.user_id,
+                {"entity_id": entity.user_id, "names": [], "roles": [], "last_seen": 0.0},
+            )
+            entry["names"].extend(names)
+            entry["names"] = list(dict.fromkeys(name for name in entry["names"] if name))
+
+        if self.store:
+            relation_claims = self.store.get_active_claims(
+                viewer_id,
+                facets=["relation.to_entity"],
+                limit=100,
+                viewer_id=viewer_id,
+            )
+            for claim in relation_claims:
+                target_entity_id = str(claim.value.get("target_entity_id") or "")
+                relation_kind = claim.value.get("relation_kind") or claim.qualifiers.get("relation_kind")
+                if not target_entity_id:
+                    continue
+                entry = known_entities.setdefault(
+                    target_entity_id,
+                    {"entity_id": target_entity_id, "names": [], "roles": [], "last_seen": 0.0},
+                )
+                entry["roles"].extend(QueryPlanner.expand_role_aliases(relation_kind))
+                entry["last_seen"] = max(entry.get("last_seen", 0.0), float(claim.last_confirmed_at or 0.0))
+                entry["roles"] = list(dict.fromkeys(role for role in entry["roles"] if role))
+
+        return list(known_entities.values())
 
     def _filter_nodes_for_targets(self, nodes: List[BaseNode], target_entities: List[str]) -> List[BaseNode]:
         if not target_entities:

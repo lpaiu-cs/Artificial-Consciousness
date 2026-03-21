@@ -130,6 +130,18 @@ class SocialManager:
         self._apply_relation_update(user_id, deltas)
         return deltas
 
+    def handle_open_loop_event(self, event: Dict[str, Any]) -> Dict[str, float]:
+        owner_id = str(event.get("owner_id", ""))
+        if not owner_id or not self._should_score_open_loop_event(event):
+            return {}
+
+        deltas = self._compose_fulfillment_deltas(event)
+        if not any(abs(value) > 0.0 for value in deltas.values()):
+            return {}
+
+        self._apply_relation_update(owner_id, deltas)
+        return deltas
+
     def _score_to_desc(self, score: float) -> str:
         """점수를 자연어 관계 설명으로 변환"""
         if score >= 90: return f"Soulmate ({score:.1f})"
@@ -276,6 +288,63 @@ class SocialManager:
                 - correction * 0.04
             ),
         }
+
+    def _should_score_open_loop_event(self, event: Dict[str, Any]) -> bool:
+        kind = str(event.get("kind") or "").strip().lower()
+        source_type = str(event.get("source_type") or "").strip().lower()
+        return source_type == "assistant_commitment" or kind in {"assistant_promise", "followup_needed"}
+
+    def _compose_fulfillment_deltas(self, event: Dict[str, Any]) -> Dict[str, float]:
+        event_type = str(event.get("event_type") or "").strip().lower()
+        terminal_status = str(event.get("terminal_status") or "").strip().lower()
+        due_at = event.get("due_at")
+        occurred_at = float(event.get("occurred_at") or time.time())
+        was_overdue = bool(event.get("was_overdue"))
+        if due_at is not None:
+            try:
+                was_overdue = was_overdue or float(due_at) < occurred_at
+            except (TypeError, ValueError):
+                pass
+
+        if event_type == "overdue":
+            return {
+                "affinity": -1.0,
+                "trust": -0.03,
+                "respect": -0.02,
+                "tension": 0.03,
+                "reliability": -0.06,
+            }
+
+        if event_type != "closed":
+            return {}
+
+        if terminal_status == "done":
+            if was_overdue:
+                return {
+                    "affinity": 0.3,
+                    "trust": 0.01,
+                    "respect": 0.0,
+                    "tension": -0.01,
+                    "reliability": 0.02,
+                }
+            return {
+                "affinity": 1.0,
+                "trust": 0.04,
+                "respect": 0.02,
+                "tension": -0.02,
+                "reliability": 0.08,
+            }
+
+        if terminal_status == "abandoned":
+            return {
+                "affinity": -1.2,
+                "trust": -0.05,
+                "respect": -0.03,
+                "tension": 0.04,
+                "reliability": -0.08,
+            }
+
+        return {}
 
     def _apply_relation_update(self, user_id: str, deltas: Dict[str, float]):
         affinity_delta = deltas.get("affinity", 0.0)
