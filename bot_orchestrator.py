@@ -73,9 +73,10 @@ class BotOrchestrator:
         user_id = str(calling_message.get("user_id"))
         session_state = self._get_session_state(user_id)
         raw_user_input = calling_message.get("msg", "")
-        sanitized_history = [self.fast_path_writer.apply_write_barriers(log) for log in history]
-        sanitized_message = self.fast_path_writer.apply_write_barriers(calling_message)
-        boundary_requested = bool(sanitized_message and sanitized_message.get("memory_redacted"))
+        sanitized_history = [self.fast_path_writer.apply_write_barriers(log, persist=False) for log in history]
+        sanitized_message = self.fast_path_writer.apply_write_barriers(calling_message, persist=True)
+        boundary_rules = list((sanitized_message or {}).get("boundary_rules") or [])
+        boundary_requested = bool(boundary_rules)
         
         # -------------------------------------------------------
         # Phase 1: Perception (지각)
@@ -118,6 +119,7 @@ class BotOrchestrator:
             relationship_desc,
             session_state,
             boundary_requested=boundary_requested,
+            boundary_rules=boundary_rules,
         )
         
         return response
@@ -212,7 +214,8 @@ class BotOrchestrator:
         return self._run_fast_reconstruction(stm_context, memory_context, current_user_id)
 
     def _act(self, user_id, user_input, context_summary, relationship_desc,
-             session_state: Dict[str, Any], boundary_requested: bool = False) -> str:
+             session_state: Dict[str, Any], boundary_requested: bool = False,
+             boundary_rules: List[Dict[str, Any]] | None = None) -> str:
         """
         [Action & Feedback Loop]
         Generate Response -> Update Mood -> Update Relationship -> Save Memory
@@ -221,12 +224,17 @@ class BotOrchestrator:
         response_text, natural_emotion = self._run_slow_generation(
             user_input, context_summary, relationship_desc, session_state["current_mood"]
         )
+        memory_safe_response, boundary_respected = self.fast_path_writer.sanitize_assistant_memory(
+            response_text,
+            boundary_rules=boundary_rules,
+        )
         
         # 2. Feedback Loop
         # (A) 현재 사용자 세션 기분 업데이트
         session_state["current_mood"] = natural_emotion
         session_state["last_user_input"] = user_input
         session_state["last_assistant_response"] = response_text
+        session_state["last_assistant_memory_text"] = memory_safe_response
         session_state["updated_at"] = time.time()
         
         # (B) 관계 업데이트 (Social Manager 위임)
@@ -237,18 +245,19 @@ class BotOrchestrator:
             assistant_text=response_text,
             user_embedding=interaction_signal_vec,
             boundary_requested=boundary_requested,
+            boundary_respected=boundary_respected,
         )
         
         # (C) 자가 기억(Self-Memory) STM 저장. 감정 태그 보존!
         bot_mem = MemoryObject(
-            content=response_text,
+            content=memory_safe_response,
             role="assistant",
             user_id=self.bot_id if self.bot_id else "bot", # ID 일관성 유지
             user_name=config.BOT_NAME,
             activation=100.0, # 내 말은 중요하므로 높은 초기값
             emotion_tag=natural_emotion
         )
-        bot_mem.embedding = self.api.get_embedding(response_text) if response_text else [0.0] * 1536
+        bot_mem.embedding = self.api.get_embedding(memory_safe_response) if memory_safe_response else [0.0] * 1536
         self.stm.inject_memories([bot_mem])
         self.reflector.submit_memories([bot_mem])
         
@@ -261,6 +270,7 @@ class BotOrchestrator:
                 "current_mood": "calm",
                 "last_user_input": "",
                 "last_assistant_response": "",
+                "last_assistant_memory_text": "",
                 "updated_at": 0.0,
             },
         )

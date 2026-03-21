@@ -2,7 +2,7 @@ import hashlib
 import json
 import re
 import time
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import config
 
@@ -21,7 +21,7 @@ class FastPathMemoryWriter:
         self._processed_barrier_keys: Dict[str, float] = {}
         self._barrier_dedupe_max_entries = int(getattr(config, "BOUNDARY_DEDUPE_MAX_ENTRIES", 2048))
 
-    def apply_write_barriers(self, log: Optional[Dict]) -> Optional[Dict]:
+    def apply_write_barriers(self, log: Optional[Dict], persist: bool = True) -> Optional[Dict]:
         if not log:
             return log
 
@@ -39,15 +39,16 @@ class FastPathMemoryWriter:
             log.get("timestamp", 0.0),
             barriers,
         )
-        if key not in self._processed_barrier_keys:
+        if persist and key not in self._processed_barrier_keys:
             self._touch_processed_barrier_key(key)
             self._save_boundary_claims(str(log.get("user_id", "")), barriers)
-        else:
+        elif persist:
             self._touch_processed_barrier_key(key)
 
         sanitized = dict(log)
         sanitized["msg"] = sanitized_text
         sanitized["memory_redacted"] = True
+        sanitized["boundary_rules"] = self._runtime_boundary_rules(barriers)
         return sanitized
 
     def process(self, memories: List[MemoryObject]):
@@ -121,12 +122,14 @@ class FastPathMemoryWriter:
         rules: List[Dict[str, str]] = []
         topic_label = self._classify_boundary_topic(text)
         target = self._boundary_target_hash(text)
+        sensitive_tokens = self._extract_sensitive_tokens(text)
         if "저장하지 마" in text or "기억하지 마" in text:
             rules.append({
                 "kind": "do_not_store_sensitive",
                 "summary": f"{topic_label} 관련 민감 주제를 저장하지 말라는 경계 요청이 있음",
                 "topic_label": topic_label,
                 "target": target,
+                "sensitive_tokens": sensitive_tokens,
             })
         if "다시 꺼내지 마" in text or "그 얘기 꺼내지 마" in text:
             rules.append({
@@ -134,6 +137,7 @@ class FastPathMemoryWriter:
                 "summary": f"{topic_label} 관련 주제를 다시 꺼내지 말라는 경계 요청이 있음",
                 "topic_label": topic_label,
                 "target": target,
+                "sensitive_tokens": sensitive_tokens,
             })
         return rules
 
@@ -184,6 +188,28 @@ class FastPathMemoryWriter:
                 sensitivity="high",
             )
 
+    def sanitize_assistant_memory(self, text: str, boundary_rules: Optional[List[Dict[str, Any]]] = None) -> tuple[str, bool]:
+        boundary_rules = boundary_rules or []
+        if not text or not boundary_rules:
+            return text, False
+
+        segments = self._segment_text(text)
+        if not segments:
+            return text, False
+
+        sanitized_segments: List[str] = []
+        redacted = False
+        for segment in segments:
+            matched_rules = self._match_boundary_rules(segment, boundary_rules)
+            if matched_rules:
+                sanitized_segments.append(self._build_boundary_placeholder(matched_rules))
+                redacted = True
+            else:
+                sanitized_segments.append(segment)
+
+        sanitized_text = " ".join(segment for segment in sanitized_segments if segment).strip()
+        return sanitized_text or text, not redacted
+
     def _build_boundary_placeholder(self, barriers: List[Dict[str, str]]) -> str:
         kinds = {barrier["kind"] for barrier in barriers}
         if "do_not_store_sensitive" in kinds and "avoid_topic" in kinds:
@@ -215,6 +241,17 @@ class FastPathMemoryWriter:
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
+    def _runtime_boundary_rules(self, barriers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [
+            {
+                "kind": barrier["kind"],
+                "topic_label": barrier["topic_label"],
+                "target": barrier["target"],
+                "sensitive_tokens": list(barrier.get("sensitive_tokens") or []),
+            }
+            for barrier in barriers
+        ]
+
     def _touch_processed_barrier_key(self, key: str):
         if key in self._processed_barrier_keys:
             self._processed_barrier_keys.pop(key, None)
@@ -243,6 +280,34 @@ class FastPathMemoryWriter:
 
     def _normalize_boundary_text(self, text: str) -> str:
         return " ".join((text or "").strip().lower().split())
+
+    def _extract_sensitive_tokens(self, text: str) -> List[str]:
+        normalized = self._normalize_boundary_text(text)
+        stripped = re.sub(
+            r"(저장하지 마|기억하지 마|다시 꺼내지 마|그 얘기 꺼내지 마)",
+            " ",
+            normalized,
+        )
+        stop_tokens = {
+            "내", "저", "나", "이", "그", "저기", "얘기", "이야기", "내용", "것", "거", "부분",
+            "주제", "기억", "저장", "다시", "꺼내지", "말", "하지", "마", "앞으로",
+        }
+        tokens: List[str] = []
+        for token in re.findall(r"[a-z0-9가-힣_]+", stripped):
+            token = re.sub(r"(은|는|이|가|을|를|에|도|만|과|와|의|로|으로|야|요)$", "", token)
+            if len(token) < 2 or token in stop_tokens:
+                continue
+            tokens.append(token)
+        return list(dict.fromkeys(tokens))
+
+    def _match_boundary_rules(self, text: str, boundary_rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        normalized = self._normalize_boundary_text(text)
+        matched: List[Dict[str, Any]] = []
+        for rule in boundary_rules:
+            tokens = [self._normalize_boundary_text(token) for token in (rule.get("sensitive_tokens") or []) if token]
+            if tokens and any(token in normalized for token in tokens):
+                matched.append(rule)
+        return matched
 
     def _save_claim(self, subject_id: str, facet: str, value: dict, qualifiers: dict,
                     nl_summary: str, confidence: float,

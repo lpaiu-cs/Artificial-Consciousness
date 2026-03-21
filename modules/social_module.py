@@ -109,7 +109,8 @@ class SocialManager:
 
     def update_relationship(self, user_id: str, user_text: str, assistant_text: str = "",
                             user_embedding: Optional[list] = None,
-                            boundary_requested: bool = False) -> Dict[str, float]:
+                            boundary_requested: bool = False,
+                            boundary_respected: bool = False) -> Dict[str, float]:
         """
         [Event-centric Relation Update]
         톤 유사도는 약한 베이스 신호로 쓰고, 감사/불만/수정/repair/boundary respect 같은
@@ -123,6 +124,7 @@ class SocialManager:
             user_text=user_text,
             assistant_text=assistant_text,
             boundary_requested=boundary_requested,
+            boundary_respected=boundary_respected,
         )
         deltas = self._compose_relation_deltas(similarity, signals)
         self._apply_relation_update(user_id, deltas)
@@ -170,7 +172,8 @@ class SocialManager:
         return float(np.dot(a, b) / (norm_a * norm_b))
 
     def _extract_interaction_signals(self, user_text: str, assistant_text: str,
-                                     boundary_requested: bool) -> Dict[str, float]:
+                                     boundary_requested: bool,
+                                     boundary_respected: bool) -> Dict[str, float]:
         user = (user_text or "").lower()
         assistant = (assistant_text or "").lower()
 
@@ -205,7 +208,8 @@ class SocialManager:
             "gratitude": float(gratitude),
             "praise": float(praise),
             "trust": float(trust),
-            "boundary_respected": float(boundary_requested),
+            "boundary_requested": float(boundary_requested),
+            "boundary_respected": float(boundary_respected),
             "repair": float(assistant_repair and (complaint or correction)),
         }
 
