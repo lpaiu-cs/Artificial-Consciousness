@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import json
 import os
 import sqlite3
@@ -7,6 +9,7 @@ import uuid
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import config
+from cryptography.fernet import Fernet, InvalidToken
 from memory.ontology import get_facet_spec
 from memory_structures import ClaimNode, OpenLoop, RelationState
 
@@ -14,10 +17,20 @@ from memory_structures import ClaimNode, OpenLoop, RelationState
 class CanonicalMemoryStore:
     """SQLite-backed canonical state store for claims, open loops, and relation state."""
 
+    PROTECTED_BOUNDARY_VALUE_FIELDS = frozenset({"target", "target_entity_id"})
+    PROTECTED_BOUNDARY_QUALIFIER_FIELDS = frozenset({
+        "sensitive_tokens",
+        "semantic_terms",
+        "target_alias_hashes",
+        "target_roles",
+    })
+
     def __init__(self, db_path: Optional[str] = None):
         self.db_path = db_path or getattr(config, "CANONICAL_MEMORY_DB_PATH", "memory_state.sqlite3")
         self._lock = threading.RLock()
         self._open_loop_listener: Optional[Callable[[Dict[str, Any]], None]] = None
+        self._payload_key_id = str(getattr(config, "CANONICAL_ENCRYPTION_KEY_ID", "local-v1"))
+        self._fernet = self._init_payload_cipher()
         self._ensure_parent_dir()
         self._init_db()
 
@@ -30,6 +43,40 @@ class CanonicalMemoryStore:
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _init_payload_cipher(self) -> Fernet:
+        configured_key = str(getattr(config, "CANONICAL_ENCRYPTION_KEY", "") or "").strip()
+        if configured_key:
+            return Fernet(self._normalize_fernet_key(configured_key.encode("utf-8")))
+
+        key_path = str(getattr(config, "CANONICAL_ENCRYPTION_KEY_PATH", "") or "").strip()
+        if not key_path:
+            key_path = f"{os.path.abspath(self.db_path)}.key"
+        key_path = os.path.abspath(os.path.expanduser(key_path))
+        os.makedirs(os.path.dirname(key_path), exist_ok=True)
+
+        if os.path.exists(key_path):
+            with open(key_path, "rb") as handle:
+                key = handle.read().strip()
+        else:
+            key = Fernet.generate_key()
+            with open(key_path, "wb") as handle:
+                handle.write(key)
+            try:
+                os.chmod(key_path, 0o600)
+            except OSError:
+                pass
+
+        return Fernet(self._normalize_fernet_key(key))
+
+    def _normalize_fernet_key(self, raw_key: bytes) -> bytes:
+        raw_key = (raw_key or b"").strip()
+        try:
+            Fernet(raw_key)
+            return raw_key
+        except Exception:
+            digest = hashlib.sha256(raw_key).digest()
+            return base64.urlsafe_b64encode(digest)
 
     def _init_db(self):
         with self._connect() as conn:
@@ -44,6 +91,8 @@ class CanonicalMemoryStore:
                     confidence REAL NOT NULL,
                     value_json TEXT NOT NULL,
                     qualifiers_json TEXT NOT NULL,
+                    encrypted_payload_blob BLOB,
+                    payload_key_id TEXT,
                     valid_from REAL,
                     valid_to REAL,
                     last_confirmed_at REAL,
@@ -89,6 +138,7 @@ class CanonicalMemoryStore:
             )
             self._migrate_claim_columns(conn)
             self._migrate_claim_scopes(conn)
+            self._migrate_sensitive_claim_payloads(conn)
             self._migrate_open_loop_columns(conn)
 
     def set_open_loop_listener(self, listener: Optional[Callable[[Dict[str, Any]], None]]):
@@ -106,6 +156,14 @@ class CanonicalMemoryStore:
         if "evidence_json" not in columns:
             conn.execute(
                 "ALTER TABLE claims ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "encrypted_payload_blob" not in columns:
+            conn.execute(
+                "ALTER TABLE claims ADD COLUMN encrypted_payload_blob BLOB"
+            )
+        if "payload_key_id" not in columns:
+            conn.execute(
+                "ALTER TABLE claims ADD COLUMN payload_key_id TEXT"
             )
 
     def _migrate_claim_scopes(self, conn: sqlite3.Connection):
@@ -134,6 +192,44 @@ class CanonicalMemoryStore:
                 ),
             )
 
+    def _migrate_sensitive_claim_payloads(self, conn: sqlite3.Connection):
+        rows = conn.execute(
+            """
+            SELECT claim_id, facet, sensitivity, value_json, qualifiers_json, encrypted_payload_blob
+            FROM claims
+            WHERE facet = ?
+            """,
+            ("boundary.rule",),
+        ).fetchall()
+        for row in rows:
+            value = json.loads(row["value_json"] or "{}")
+            qualifiers = json.loads(row["qualifiers_json"] or "{}")
+            public_value, public_qualifiers, protected_payload = self._split_sensitive_payload(
+                row["facet"],
+                row["sensitivity"],
+                value,
+                qualifiers,
+            )
+            if row["encrypted_payload_blob"] and not protected_payload:
+                continue
+            if not protected_payload and not row["encrypted_payload_blob"]:
+                continue
+            encrypted_blob, payload_key_id = self._encode_protected_payload(protected_payload)
+            conn.execute(
+                """
+                UPDATE claims
+                SET value_json = ?, qualifiers_json = ?, encrypted_payload_blob = ?, payload_key_id = ?
+                WHERE claim_id = ?
+                """,
+                (
+                    json.dumps(public_value, ensure_ascii=False, sort_keys=True),
+                    json.dumps(public_qualifiers, ensure_ascii=False, sort_keys=True),
+                    encrypted_blob,
+                    payload_key_id,
+                    row["claim_id"],
+                ),
+            )
+
     def _migrate_open_loop_columns(self, conn: sqlite3.Connection):
         columns = {
             row["name"]
@@ -155,15 +251,16 @@ class CanonicalMemoryStore:
             claim.value,
             claim.qualifiers,
         )
+        public_value, public_qualifiers, encrypted_blob, payload_key_id = self._prepare_claim_storage(claim)
         with self._lock, self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO claims (
                     claim_id, subject_id, facet, merge_key, status, confidence,
-                    value_json, qualifiers_json, valid_from, valid_to,
+                    value_json, qualifiers_json, encrypted_payload_blob, payload_key_id, valid_from, valid_to,
                     last_confirmed_at, source_type, evidence_json,
                     sensitivity, scope, nl_summary, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(claim_id) DO UPDATE SET
                     subject_id=excluded.subject_id,
                     facet=excluded.facet,
@@ -172,6 +269,8 @@ class CanonicalMemoryStore:
                     confidence=excluded.confidence,
                     value_json=excluded.value_json,
                     qualifiers_json=excluded.qualifiers_json,
+                    encrypted_payload_blob=excluded.encrypted_payload_blob,
+                    payload_key_id=excluded.payload_key_id,
                     valid_from=excluded.valid_from,
                     valid_to=excluded.valid_to,
                     last_confirmed_at=excluded.last_confirmed_at,
@@ -189,8 +288,10 @@ class CanonicalMemoryStore:
                     claim.merge_key,
                     claim.status,
                     claim.confidence,
-                    json.dumps(claim.value, ensure_ascii=False, sort_keys=True),
-                    json.dumps(claim.qualifiers, ensure_ascii=False, sort_keys=True),
+                    json.dumps(public_value, ensure_ascii=False, sort_keys=True),
+                    json.dumps(public_qualifiers, ensure_ascii=False, sort_keys=True),
+                    encrypted_blob,
+                    payload_key_id,
                     claim.valid_from,
                     claim.valid_to,
                     claim.last_confirmed_at,
@@ -569,9 +670,64 @@ class CanonicalMemoryStore:
 
         return self.save_relation_state(state)
 
+    def _prepare_claim_storage(self, claim: ClaimNode) -> tuple[Dict[str, Any], Dict[str, Any], Optional[bytes], Optional[str]]:
+        public_value, public_qualifiers, protected_payload = self._split_sensitive_payload(
+            claim.facet,
+            claim.sensitivity,
+            claim.value,
+            claim.qualifiers,
+        )
+        encrypted_blob, payload_key_id = self._encode_protected_payload(protected_payload)
+        return public_value, public_qualifiers, encrypted_blob, payload_key_id
+
+    def _split_sensitive_payload(self, facet: str, sensitivity: Optional[str],
+                                 value: Dict[str, Any], qualifiers: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+        public_value = dict(value or {})
+        public_qualifiers = dict(qualifiers or {})
+        protected_value: Dict[str, Any] = {}
+        protected_qualifiers: Dict[str, Any] = {}
+
+        if facet == "boundary.rule" and (sensitivity or "high") == "high":
+            for field in self.PROTECTED_BOUNDARY_VALUE_FIELDS:
+                if field in public_value:
+                    protected_value[field] = public_value.pop(field)
+            for field in self.PROTECTED_BOUNDARY_QUALIFIER_FIELDS:
+                if field in public_qualifiers:
+                    protected_qualifiers[field] = public_qualifiers.pop(field)
+
+        protected_payload = {}
+        if protected_value:
+            protected_payload["value"] = protected_value
+        if protected_qualifiers:
+            protected_payload["qualifiers"] = protected_qualifiers
+        return public_value, public_qualifiers, protected_payload
+
+    def _encode_protected_payload(self, protected_payload: Dict[str, Any]) -> tuple[Optional[bytes], Optional[str]]:
+        if not protected_payload:
+            return None, None
+        payload_json = json.dumps(protected_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return self._fernet.encrypt(payload_json), self._payload_key_id
+
+    def _decode_protected_payload(self, encrypted_blob: Any, payload_key_id: Optional[str]) -> Dict[str, Any]:
+        if not encrypted_blob:
+            return {}
+        try:
+            decrypted = self._fernet.decrypt(bytes(encrypted_blob))
+        except InvalidToken as exc:
+            raise RuntimeError(
+                f"Unable to decrypt canonical memory payload with key_id={payload_key_id or 'unknown'}"
+            ) from exc
+        return json.loads(decrypted.decode("utf-8"))
+
     def _row_to_claim(self, row: sqlite3.Row) -> ClaimNode:
         value = json.loads(row["value_json"])
         qualifiers = json.loads(row["qualifiers_json"])
+        protected_payload = self._decode_protected_payload(
+            row["encrypted_payload_blob"],
+            row["payload_key_id"],
+        )
+        value.update(protected_payload.get("value", {}))
+        qualifiers.update(protected_payload.get("qualifiers", {}))
         scope, qualifiers = self._normalize_scope_and_qualifiers(
             row["subject_id"],
             row["scope"] or "user_private",
