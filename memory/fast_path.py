@@ -215,6 +215,7 @@ class FastPathMemoryWriter:
                     "topic_label": barrier["topic_label"],
                     "sensitive_tokens": list(barrier.get("sensitive_tokens") or []),
                     "semantic_terms": self._topic_semantic_terms(barrier["topic_label"]),
+                    "target_aliases": list(barrier.get("target_aliases") or []),
                     "target_alias_hashes": list(barrier.get("target_alias_hashes") or []),
                     "target_roles": list(barrier.get("target_roles") or []),
                 },
@@ -441,6 +442,7 @@ class FastPathMemoryWriter:
             "target_entity_id": claim.value.get("target_entity_id") or "",
             "sensitive_tokens": list(claim.qualifiers.get("sensitive_tokens") or []),
             "semantic_terms": list(claim.qualifiers.get("semantic_terms") or []),
+            "target_aliases": list(claim.qualifiers.get("target_aliases") or []),
             "target_alias_hashes": list(claim.qualifiers.get("target_alias_hashes") or []),
             "target_roles": list(claim.qualifiers.get("target_roles") or []),
         }

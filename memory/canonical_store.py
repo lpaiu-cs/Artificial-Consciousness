@@ -17,22 +17,27 @@ from memory_structures import ClaimNode, OpenLoop, RelationState
 class CanonicalMemoryStore:
     """SQLite-backed canonical state store for claims, open loops, and relation state."""
 
-    PROTECTED_BOUNDARY_VALUE_FIELDS = frozenset({"target", "target_entity_id"})
-    PROTECTED_BOUNDARY_QUALIFIER_FIELDS = frozenset({
-        "sensitive_tokens",
-        "semantic_terms",
-        "target_alias_hashes",
-        "target_roles",
-    })
+    PROTECTED_BOUNDARY_VALUE_FIELDS = frozenset()
+    PROTECTED_BOUNDARY_QUALIFIER_FIELDS = frozenset()
 
     def __init__(self, db_path: Optional[str] = None):
         self.db_path = db_path or getattr(config, "CANONICAL_MEMORY_DB_PATH", "memory_state.sqlite3")
         self._lock = threading.RLock()
         self._open_loop_listener: Optional[Callable[[Dict[str, Any]], None]] = None
-        self._payload_key_id = str(getattr(config, "CANONICAL_ENCRYPTION_KEY_ID", "local-v1"))
-        self._fernet = self._init_payload_cipher()
+        self._payload_ciphers: Dict[str, Fernet] = {}
+        self._active_payload_key_id = str(
+            getattr(
+                config,
+                "CANONICAL_ACTIVE_KEY_ID",
+                getattr(config, "CANONICAL_ENCRYPTION_KEY_ID", "local-v1"),
+            )
+        )
+        self._payload_keyring_path = ""
+        self._init_payload_keyring()
         self._ensure_parent_dir()
         self._init_db()
+        if getattr(config, "CANONICAL_AUTO_REENCRYPT_PROTECTED_PAYLOADS", False):
+            self.reencrypt_protected_claim_payloads()
 
     def _ensure_parent_dir(self):
         parent = os.path.dirname(os.path.abspath(self.db_path))
@@ -44,30 +49,159 @@ class CanonicalMemoryStore:
         conn.row_factory = sqlite3.Row
         return conn
 
-    def _init_payload_cipher(self) -> Fernet:
+    def _init_payload_keyring(self):
+        keyring_data, keyring_path = self._resolve_payload_keyring_data()
+        keys = keyring_data.get("keys", {})
+        self._payload_ciphers = {
+            str(key_id): Fernet(self._normalize_fernet_key(str(raw_key).encode("utf-8")))
+            for key_id, raw_key in keys.items()
+            if str(key_id).strip() and str(raw_key).strip()
+        }
+        if not self._payload_ciphers:
+            raise RuntimeError("Canonical payload keyring is empty.")
+
+        active_key_id = str(
+            keyring_data.get("active_key_id")
+            or self._active_payload_key_id
+            or getattr(config, "CANONICAL_ENCRYPTION_KEY_ID", "local-v1")
+        ).strip()
+        if active_key_id not in self._payload_ciphers:
+            raise RuntimeError(f"Canonical payload keyring missing active key_id={active_key_id}")
+
+        self._active_payload_key_id = active_key_id
+        self._payload_keyring_path = keyring_path
+
+    def _resolve_payload_keyring_data(self) -> tuple[Dict[str, Any], str]:
+        keyring_path = self._default_keyring_path()
+        env_keys_json = str(getattr(config, "CANONICAL_ENCRYPTION_KEYS_JSON", "") or "").strip()
+        if env_keys_json:
+            parsed = json.loads(env_keys_json)
+            if not isinstance(parsed, dict):
+                raise RuntimeError("CANONICAL_ENCRYPTION_KEYS_JSON must be a JSON object.")
+            active_key_id = str(
+                getattr(config, "CANONICAL_ACTIVE_KEY_ID", "")
+                or getattr(config, "CANONICAL_ENCRYPTION_KEY_ID", "")
+                or next(iter(parsed.keys()), "local-v1")
+            ).strip()
+            return {
+                "active_key_id": active_key_id,
+                "keys": {str(key_id): str(key_value) for key_id, key_value in parsed.items()},
+            }, keyring_path
+
+        configured_keyring_path = str(getattr(config, "CANONICAL_ENCRYPTION_KEYRING_PATH", "") or "").strip()
+        if configured_keyring_path:
+            keyring_path = os.path.abspath(os.path.expanduser(configured_keyring_path))
+        os.makedirs(os.path.dirname(keyring_path), exist_ok=True)
+
+        if os.path.exists(keyring_path):
+            keyring_data = self._load_keyring_file(keyring_path)
+            self._persist_keyring_file(keyring_path, keyring_data)
+            return keyring_data, keyring_path
+
         configured_key = str(getattr(config, "CANONICAL_ENCRYPTION_KEY", "") or "").strip()
         if configured_key:
-            return Fernet(self._normalize_fernet_key(configured_key.encode("utf-8")))
+            active_key_id = str(
+                getattr(config, "CANONICAL_ACTIVE_KEY_ID", "")
+                or getattr(config, "CANONICAL_ENCRYPTION_KEY_ID", "local-v1")
+            ).strip()
+            return {
+                "active_key_id": active_key_id,
+                "keys": {active_key_id: configured_key},
+            }, keyring_path
 
-        key_path = str(getattr(config, "CANONICAL_ENCRYPTION_KEY_PATH", "") or "").strip()
-        if not key_path:
-            key_path = f"{os.path.abspath(self.db_path)}.key"
-        key_path = os.path.abspath(os.path.expanduser(key_path))
-        os.makedirs(os.path.dirname(key_path), exist_ok=True)
+        legacy_key_path = str(getattr(config, "CANONICAL_ENCRYPTION_KEY_PATH", "") or "").strip()
+        if legacy_key_path:
+            legacy_key_path = os.path.abspath(os.path.expanduser(legacy_key_path))
+            if os.path.exists(legacy_key_path):
+                with open(legacy_key_path, "rb") as handle:
+                    legacy_key = handle.read().strip()
+                active_key_id = str(
+                    getattr(config, "CANONICAL_ACTIVE_KEY_ID", "")
+                    or getattr(config, "CANONICAL_ENCRYPTION_KEY_ID", "local-v1")
+                ).strip()
+                keyring_data = {
+                    "active_key_id": active_key_id,
+                    "keys": {active_key_id: legacy_key.decode("utf-8")},
+                }
+                self._persist_keyring_file(keyring_path, keyring_data)
+                return keyring_data, keyring_path
 
-        if os.path.exists(key_path):
-            with open(key_path, "rb") as handle:
-                key = handle.read().strip()
-        else:
-            key = Fernet.generate_key()
-            with open(key_path, "wb") as handle:
-                handle.write(key)
-            try:
-                os.chmod(key_path, 0o600)
-            except OSError:
-                pass
+        active_key_id = str(
+            getattr(config, "CANONICAL_ACTIVE_KEY_ID", "")
+            or getattr(config, "CANONICAL_ENCRYPTION_KEY_ID", "local-v1")
+        ).strip()
+        keyring_data = {
+            "active_key_id": active_key_id,
+            "keys": {active_key_id: Fernet.generate_key().decode("utf-8")},
+        }
+        self._persist_keyring_file(keyring_path, keyring_data)
+        return keyring_data, keyring_path
 
-        return Fernet(self._normalize_fernet_key(key))
+    def _default_keyring_path(self) -> str:
+        configured_keyring_path = str(getattr(config, "CANONICAL_ENCRYPTION_KEYRING_PATH", "") or "").strip()
+        if configured_keyring_path:
+            return os.path.abspath(os.path.expanduser(configured_keyring_path))
+        return f"{os.path.abspath(self.db_path)}.keyring.json"
+
+    def _load_keyring_file(self, keyring_path: str) -> Dict[str, Any]:
+        with open(keyring_path, "r", encoding="utf-8") as handle:
+            raw_content = handle.read().strip()
+        if not raw_content:
+            raise RuntimeError(f"Canonical keyring file is empty: {keyring_path}")
+
+        try:
+            data = json.loads(raw_content)
+        except json.JSONDecodeError:
+            active_key_id = str(
+                getattr(config, "CANONICAL_ACTIVE_KEY_ID", "")
+                or getattr(config, "CANONICAL_ENCRYPTION_KEY_ID", "local-v1")
+            ).strip()
+            return {
+                "active_key_id": active_key_id,
+                "keys": {active_key_id: raw_content},
+            }
+
+        if "keys" in data:
+            keys = data.get("keys", {})
+            active_key_id = str(
+                data.get("active_key_id")
+                or getattr(config, "CANONICAL_ACTIVE_KEY_ID", "")
+                or getattr(config, "CANONICAL_ENCRYPTION_KEY_ID", "")
+                or next(iter(keys.keys()), "local-v1")
+            ).strip()
+            return {
+                "active_key_id": active_key_id,
+                "keys": {str(key_id): str(key_value) for key_id, key_value in keys.items()},
+            }
+
+        if isinstance(data, dict):
+            active_key_id = str(
+                getattr(config, "CANONICAL_ACTIVE_KEY_ID", "")
+                or getattr(config, "CANONICAL_ENCRYPTION_KEY_ID", "")
+                or next(iter(data.keys()), "local-v1")
+            ).strip()
+            return {
+                "active_key_id": active_key_id,
+                "keys": {str(key_id): str(key_value) for key_id, key_value in data.items()},
+            }
+
+        raise RuntimeError(f"Unsupported canonical keyring format: {keyring_path}")
+
+    def _persist_keyring_file(self, keyring_path: str, keyring_data: Dict[str, Any]):
+        os.makedirs(os.path.dirname(keyring_path), exist_ok=True)
+        payload = {
+            "active_key_id": str(keyring_data.get("active_key_id") or "").strip(),
+            "keys": {
+                str(key_id): str(key_value)
+                for key_id, key_value in (keyring_data.get("keys") or {}).items()
+            },
+        }
+        with open(keyring_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        try:
+            os.chmod(keyring_path, 0o600)
+        except OSError:
+            pass
 
     def _normalize_fernet_key(self, raw_key: bytes) -> bytes:
         raw_key = (raw_key or b"").strip()
@@ -195,7 +329,7 @@ class CanonicalMemoryStore:
     def _migrate_sensitive_claim_payloads(self, conn: sqlite3.Connection):
         rows = conn.execute(
             """
-            SELECT claim_id, facet, sensitivity, value_json, qualifiers_json, encrypted_payload_blob
+            SELECT claim_id, facet, sensitivity, value_json, qualifiers_json, encrypted_payload_blob, payload_key_id
             FROM claims
             WHERE facet = ?
             """,
@@ -210,11 +344,18 @@ class CanonicalMemoryStore:
                 value,
                 qualifiers,
             )
-            if row["encrypted_payload_blob"] and not protected_payload:
+            existing_protected_payload = {}
+            if row["encrypted_payload_blob"] and row["payload_key_id"] and not protected_payload:
                 continue
+            if row["encrypted_payload_blob"]:
+                existing_protected_payload = self._decode_protected_payload(
+                    row["encrypted_payload_blob"],
+                    row["payload_key_id"],
+                )
             if not protected_payload and not row["encrypted_payload_blob"]:
                 continue
-            encrypted_blob, payload_key_id = self._encode_protected_payload(protected_payload)
+            merged_payload = self._merge_protected_payloads(existing_protected_payload, protected_payload)
+            encrypted_blob, payload_key_id = self._encode_protected_payload(merged_payload)
             conn.execute(
                 """
                 UPDATE claims
@@ -688,12 +829,26 @@ class CanonicalMemoryStore:
         protected_qualifiers: Dict[str, Any] = {}
 
         if facet == "boundary.rule" and (sensitivity or "high") == "high":
-            for field in self.PROTECTED_BOUNDARY_VALUE_FIELDS:
-                if field in public_value:
-                    protected_value[field] = public_value.pop(field)
-            for field in self.PROTECTED_BOUNDARY_QUALIFIER_FIELDS:
-                if field in public_qualifiers:
-                    protected_qualifiers[field] = public_qualifiers.pop(field)
+            public_value = {
+                key: field_value
+                for key, field_value in public_value.items()
+                if key in ClaimNode.BOUNDARY_PUBLIC_VALUE_FIELDS
+            }
+            protected_value = {
+                key: field_value
+                for key, field_value in (value or {}).items()
+                if key not in ClaimNode.BOUNDARY_PUBLIC_VALUE_FIELDS and field_value not in (None, "", [], {})
+            }
+            public_qualifiers = {
+                key: field_value
+                for key, field_value in public_qualifiers.items()
+                if key in ClaimNode.BOUNDARY_PUBLIC_QUALIFIER_FIELDS
+            }
+            protected_qualifiers = {
+                key: field_value
+                for key, field_value in (qualifiers or {}).items()
+                if key not in ClaimNode.BOUNDARY_PUBLIC_QUALIFIER_FIELDS and field_value not in (None, "", [], {})
+            }
 
         protected_payload = {}
         if protected_value:
@@ -706,18 +861,99 @@ class CanonicalMemoryStore:
         if not protected_payload:
             return None, None
         payload_json = json.dumps(protected_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        return self._fernet.encrypt(payload_json), self._payload_key_id
+        cipher = self._payload_ciphers.get(self._active_payload_key_id)
+        if cipher is None:
+            raise RuntimeError(f"Canonical payload keyring missing active key_id={self._active_payload_key_id}")
+        return cipher.encrypt(payload_json), self._active_payload_key_id
 
     def _decode_protected_payload(self, encrypted_blob: Any, payload_key_id: Optional[str]) -> Dict[str, Any]:
         if not encrypted_blob:
             return {}
+        if payload_key_id:
+            cipher = self._payload_ciphers.get(str(payload_key_id))
+            if cipher is None:
+                raise RuntimeError(
+                    f"Unable to decrypt canonical memory payload: missing key_id={payload_key_id}"
+                )
+            try:
+                decrypted = cipher.decrypt(bytes(encrypted_blob))
+            except InvalidToken as exc:
+                raise RuntimeError(
+                    f"Unable to decrypt canonical memory payload with key_id={payload_key_id}"
+                ) from exc
+            return json.loads(decrypted.decode("utf-8"))
+
+        for legacy_key_id, cipher in self._payload_ciphers.items():
+            try:
+                decrypted = cipher.decrypt(bytes(encrypted_blob))
+                return json.loads(decrypted.decode("utf-8"))
+            except InvalidToken:
+                continue
         try:
-            decrypted = self._fernet.decrypt(bytes(encrypted_blob))
-        except InvalidToken as exc:
+            if len(self._payload_ciphers) == 1:
+                only_key_id, cipher = next(iter(self._payload_ciphers.items()))
+                decrypted = cipher.decrypt(bytes(encrypted_blob))
+                return json.loads(decrypted.decode("utf-8"))
+        except InvalidToken:
+            pass
+        raise RuntimeError(
+            "Unable to decrypt canonical memory payload with legacy key fallback"
+        )
+
+    def reencrypt_protected_claim_payloads(self, target_key_id: Optional[str] = None) -> int:
+        desired_key_id = str(target_key_id or self._active_payload_key_id or "").strip()
+        if desired_key_id not in self._payload_ciphers:
             raise RuntimeError(
-                f"Unable to decrypt canonical memory payload with key_id={payload_key_id or 'unknown'}"
-            ) from exc
-        return json.loads(decrypted.decode("utf-8"))
+                f"Cannot re-encrypt protected payloads: missing key_id={desired_key_id}"
+            )
+
+        updated_rows = 0
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT claim_id, encrypted_payload_blob, payload_key_id
+                FROM claims
+                WHERE encrypted_payload_blob IS NOT NULL
+                """
+            ).fetchall()
+            for row in rows:
+                protected_payload = self._decode_protected_payload(
+                    row["encrypted_payload_blob"],
+                    row["payload_key_id"],
+                )
+                encrypted_blob, payload_key_id = self._encode_with_key_id(protected_payload, desired_key_id)
+                conn.execute(
+                    """
+                    UPDATE claims
+                    SET encrypted_payload_blob = ?, payload_key_id = ?, updated_at = ?
+                    WHERE claim_id = ?
+                    """,
+                    (encrypted_blob, payload_key_id, time.time(), row["claim_id"]),
+                )
+                updated_rows += 1
+        return updated_rows
+
+    def _encode_with_key_id(self, protected_payload: Dict[str, Any], key_id: str) -> tuple[Optional[bytes], Optional[str]]:
+        if not protected_payload:
+            return None, None
+        cipher = self._payload_ciphers.get(str(key_id))
+        if cipher is None:
+            raise RuntimeError(f"Canonical payload keyring missing key_id={key_id}")
+        payload_json = json.dumps(protected_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return cipher.encrypt(payload_json), str(key_id)
+
+    def _merge_protected_payloads(self, base_payload: Dict[str, Any], incoming_payload: Dict[str, Any]) -> Dict[str, Any]:
+        merged = {
+            "value": dict(base_payload.get("value", {})),
+            "qualifiers": dict(base_payload.get("qualifiers", {})),
+        }
+        merged["value"].update(incoming_payload.get("value", {}))
+        merged["qualifiers"].update(incoming_payload.get("qualifiers", {}))
+        if not merged["value"]:
+            merged.pop("value")
+        if not merged["qualifiers"]:
+            merged.pop("qualifiers")
+        return merged
 
     def _row_to_claim(self, row: sqlite3.Row) -> ClaimNode:
         value = json.loads(row["value_json"])

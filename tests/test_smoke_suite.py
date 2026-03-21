@@ -1,8 +1,10 @@
 import json
 import sqlite3
 import time
+from pathlib import Path
 
 import pytest
+from cryptography.fernet import Fernet
 
 import config
 from api_client import UnifiedAPIClient
@@ -84,6 +86,153 @@ def test_boundary_payload_is_encrypted_and_runtime_behavior_is_split(smoke_orche
     repaired = bot.process_trigger([], avoid_topic_msg)
     assert "병력" not in repaired
     assert "꺼내지 않아야" in repaired or "피해야 한다" in repaired
+
+
+def test_boundary_payload_is_not_plaintext_in_graph_snapshot_or_delta(
+    smoke_orchestrator,
+    temp_graph_files,
+    temp_canonical_db,
+):
+    bot = smoke_orchestrator
+    boundary_msg = {
+        "user_id": "user_001",
+        "user_name": "테스터",
+        "msg": "내 병력 얘기는 저장하지 마",
+        "role": "user",
+        "timestamp": time.time(),
+    }
+    bot._run_slow_generation = lambda *args, **kwargs: ("알겠다. 병력 이야기는 저장하지 않겠다.", "차분함")
+    bot.process_trigger([], boundary_msg)
+
+    delta_path = Path(bot.ltm_graph.delta_path)
+    delta_text = delta_path.read_text(encoding="utf-8")
+    assert "병력" not in delta_text
+    for marker in [
+        "sensitive_tokens",
+        "semantic_terms",
+        "target_roles",
+        "target_alias_hashes",
+        "target_aliases",
+        "target_entity_id",
+    ]:
+        assert marker not in delta_text
+
+    bot.ltm_graph.save_all()
+    snapshot_text = Path(temp_graph_files["graph_path"]).read_text(encoding="utf-8")
+    delta_after_checkpoint = delta_path.read_text(encoding="utf-8")
+    combined = snapshot_text + delta_after_checkpoint
+
+    assert "병력" not in combined
+    assert '"facet": "boundary.rule"' in snapshot_text
+    for marker in [
+        "sensitive_tokens",
+        "semantic_terms",
+        "target_roles",
+        "target_alias_hashes",
+        "target_aliases",
+        "target_entity_id",
+    ]:
+        assert marker not in combined
+
+    with sqlite3.connect(temp_canonical_db) as conn:
+        row = conn.execute(
+            """
+            SELECT value_json, qualifiers_json, encrypted_payload_blob
+            FROM claims
+            WHERE facet = 'boundary.rule'
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    assert row[2] is not None
+    assert "병력" not in row[0]
+    assert "병력" not in row[1]
+
+
+def test_boundary_payload_supports_keyring_decode_and_rotation(temp_canonical_db, canonical_keyring):
+    key_a = Fernet.generate_key().decode("utf-8")
+    key_b = Fernet.generate_key().decode("utf-8")
+    canonical_keyring({"key-a": key_a}, active_key_id="key-a")
+
+    boundary_claim = ClaimNode(
+        node_id="boundary-keyring-claim",
+        subject_id="user_001",
+        facet="boundary.rule",
+        merge_key="user_001|boundary.rule|kind=do_not_store_sensitive|target=health-fingerprint",
+        value={
+            "kind": "do_not_store_sensitive",
+            "policy_kind": "do_not_store_sensitive",
+            "target": "health-fingerprint",
+            "target_entity_id": "user_001",
+        },
+        qualifiers={
+            "topic_label": "health",
+            "sensitive_tokens": ["병력"],
+            "semantic_terms": ["병력", "진료", "의료"],
+            "target_aliases": ["본인"],
+            "target_alias_hashes": ["abc123"],
+            "target_roles": ["self"],
+        },
+        nl_summary="health 관련 민감 주제를 저장하지 말라는 경계 요청이 있음",
+        source_type="explicit",
+        confidence=0.98,
+        status="active",
+        last_confirmed_at=time.time(),
+        sensitivity="high",
+        scope="user_private",
+    )
+
+    store_a = CanonicalMemoryStore(temp_canonical_db)
+    store_a.upsert_claim(boundary_claim)
+    with sqlite3.connect(temp_canonical_db) as conn:
+        payload_row = conn.execute(
+            "SELECT payload_key_id FROM claims WHERE claim_id = ?",
+            (boundary_claim.node_id,),
+        ).fetchone()
+    assert payload_row[0] == "key-a"
+
+    canonical_keyring({"key-a": key_a, "key-b": key_b}, active_key_id="key-a")
+    store_ab = CanonicalMemoryStore(temp_canonical_db)
+    decoded_claim = store_ab.get_active_claims(
+        subject_id="user_001",
+        facets=["boundary.rule"],
+        viewer_id="user_001",
+        limit=1,
+    )[0]
+    assert decoded_claim.qualifiers["sensitive_tokens"] == ["병력"]
+    assert decoded_claim.value["target_entity_id"] == "user_001"
+
+    canonical_keyring({"key-b": key_b}, active_key_id="key-b")
+    store_missing = CanonicalMemoryStore(temp_canonical_db)
+    with pytest.raises(RuntimeError, match="missing key_id=key-a"):
+        store_missing.get_active_claims(
+            subject_id="user_001",
+            facets=["boundary.rule"],
+            viewer_id="user_001",
+            limit=1,
+        )
+
+    canonical_keyring({"key-a": key_a, "key-b": key_b}, active_key_id="key-b")
+    store_rotator = CanonicalMemoryStore(temp_canonical_db)
+    rotated = store_rotator.reencrypt_protected_claim_payloads()
+    assert rotated >= 1
+    with sqlite3.connect(temp_canonical_db) as conn:
+        rotated_row = conn.execute(
+            "SELECT payload_key_id FROM claims WHERE claim_id = ?",
+            (boundary_claim.node_id,),
+        ).fetchone()
+    assert rotated_row[0] == "key-b"
+
+    canonical_keyring({"key-b": key_b}, active_key_id="key-b")
+    store_b = CanonicalMemoryStore(temp_canonical_db)
+    rotated_claim = store_b.get_active_claims(
+        subject_id="user_001",
+        facets=["boundary.rule"],
+        viewer_id="user_001",
+        limit=1,
+    )[0]
+    assert rotated_claim.qualifiers["sensitive_tokens"] == ["병력"]
+    assert rotated_claim.value["target"] == "health-fingerprint"
 
 
 def test_boundary_semantic_fallback_is_bounded_and_cached(temp_graph_files, temp_canonical_db):

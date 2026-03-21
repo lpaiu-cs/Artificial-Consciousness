@@ -1,7 +1,7 @@
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, ClassVar
 
 @dataclass
 class MemoryObject:
@@ -50,6 +50,9 @@ class BaseNode:
     def to_dict(self):
         return asdict(self)
 
+    def to_graph_dict(self):
+        return self.to_dict()
+
 @dataclass
 class EpisodeNode(BaseNode):
     """Tier 1: 구체적인 사건 (Immutable)"""
@@ -83,6 +86,9 @@ class NoteNode(BaseNode):
 @dataclass
 class ClaimNode(BaseNode):
     """Current or reviewable state with facet-specific merge rules."""
+    BOUNDARY_PUBLIC_VALUE_FIELDS: ClassVar[frozenset[str]] = frozenset({"kind", "policy_kind"})
+    BOUNDARY_PUBLIC_QUALIFIER_FIELDS: ClassVar[frozenset[str]] = frozenset({"topic_label", "audience_ids", "participants"})
+
     subject_id: str = ""
     facet: str = ""
     merge_key: str = ""
@@ -99,6 +105,26 @@ class ClaimNode(BaseNode):
     sensitivity: str = "personal"
     scope: str = "user_private"
     type: str = "claim"
+
+    def to_graph_dict(self):
+        data = self.to_dict()
+        if self.facet != "boundary.rule":
+            return data
+
+        public_value = {
+            key: value
+            for key, value in (data.get("value") or {}).items()
+            if key in self.BOUNDARY_PUBLIC_VALUE_FIELDS and value not in (None, "", [], {})
+        }
+        public_qualifiers = {
+            key: value
+            for key, value in (data.get("qualifiers") or {}).items()
+            if key in self.BOUNDARY_PUBLIC_QUALIFIER_FIELDS and value not in (None, "", [], {})
+        }
+
+        data["value"] = public_value
+        data["qualifiers"] = public_qualifiers
+        return data
 
 @dataclass
 class EntityNode(BaseNode):

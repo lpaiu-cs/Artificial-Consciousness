@@ -3,14 +3,18 @@ CogBot Test Configuration
 - Fixtures for mocking external APIs
 - Shared test utilities
 """
-import pytest
 import sys
 import os
+import json
 from unittest.mock import MagicMock, patch
 from typing import List
+import pytest
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import config
+from cryptography.fernet import Fernet
 
 
 # =============================================================================
@@ -125,6 +129,37 @@ def temp_graph_files(tmp_path):
 def temp_canonical_db(tmp_path):
     """Provides a temporary SQLite path for canonical memory."""
     return str(tmp_path / "memory_state.sqlite3")
+
+
+@pytest.fixture
+def canonical_keyring(monkeypatch, tmp_path):
+    """Configure a temporary canonical payload keyring for reproducible tests."""
+    keyring_path = tmp_path / "canonical_payload_keys.json"
+
+    def configure(keys: dict | None = None, active_key_id: str = "local-v1", auto_reencrypt: bool = False):
+        effective_keys = keys or {active_key_id: Fernet.generate_key().decode("utf-8")}
+        payload = {
+            "active_key_id": active_key_id,
+            "keys": {str(key_id): str(key_value) for key_id, key_value in effective_keys.items()},
+        }
+        keyring_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(config, "CANONICAL_ACTIVE_KEY_ID", active_key_id, raising=False)
+        monkeypatch.setattr(config, "CANONICAL_ENCRYPTION_KEYS_JSON", "", raising=False)
+        monkeypatch.setattr(config, "CANONICAL_ENCRYPTION_KEYRING_PATH", str(keyring_path), raising=False)
+        monkeypatch.setattr(config, "CANONICAL_ENCRYPTION_KEY", "", raising=False)
+        monkeypatch.setattr(config, "CANONICAL_ENCRYPTION_KEY_ID", active_key_id, raising=False)
+        monkeypatch.setattr(config, "CANONICAL_ENCRYPTION_KEY_PATH", "", raising=False)
+        monkeypatch.setattr(config, "CANONICAL_AUTO_REENCRYPT_PROTECTED_PAYLOADS", auto_reencrypt, raising=False)
+        return {
+            "path": str(keyring_path),
+            "active_key_id": active_key_id,
+            "keys": effective_keys,
+        }
+
+    return configure
 
 
 @pytest.fixture

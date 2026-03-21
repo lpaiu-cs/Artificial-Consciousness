@@ -35,6 +35,7 @@ class MemoryGraph:
         self.claims: Dict[str, ClaimNode] = {}
         self.entities: Dict[str, EntityNode] = {}
         self._embeddings_cache: Dict[str, list] = {}
+        self._boundary_persistence_migration_needed = False
         
         # 초기 로드 (Snapshot + Replay)
         self._load_all()
@@ -253,7 +254,7 @@ class MemoryGraph:
                     self._update_interval_payload(node.value, node.valid_from, node.valid_to)
                 self.claims[node.node_id] = node
 
-            self._append_log("UPSERT_NODE", {"category": "claims", "data": node.to_dict()})
+            self._append_log("UPSERT_NODE", {"category": "claims", "data": self._claim_to_public_graph_payload(node)})
             if embedding:
                 self._embeddings_cache[node.node_id] = embedding
                 self._append_log("UPSERT_EMBEDDING", {"node_id": node.node_id, "vector": embedding})
@@ -483,7 +484,7 @@ class MemoryGraph:
             if claim.status == "active":
                 claim.status = "superseded"
                 claim.last_confirmed_at = time.time()
-                self._append_log("UPSERT_NODE", {"category": "claims", "data": claim.to_dict()})
+                self._append_log("UPSERT_NODE", {"category": "claims", "data": self._claim_to_public_graph_payload(claim)})
 
     def _normalize_claim_scope(self, scope: Optional[str]) -> str:
         normalized = str(scope or "user_private").strip().lower()
@@ -513,6 +514,27 @@ class MemoryGraph:
                     audience_ids.append(str(audience_id))
         normalized["audience_ids"] = list(dict.fromkeys(audience_ids))
         return normalized
+
+    def _claim_to_public_graph_payload(self, claim: ClaimNode) -> Dict[str, Any]:
+        data = claim.to_graph_dict()
+        data.pop("embedding", None)
+        return data
+
+    def _sanitize_persisted_claim_data(self, data: Dict[str, Any]) -> tuple[Dict[str, Any], bool]:
+        raw_data = dict(data or {})
+        if raw_data.get("facet") != "boundary.rule":
+            return raw_data, False
+
+        sanitized = ClaimNode(**raw_data).to_graph_dict()
+        sanitized.pop("embedding", None)
+        raw_without_embedding = dict(raw_data)
+        raw_without_embedding.pop("embedding", None)
+        changed = json.dumps(raw_without_embedding, ensure_ascii=False, sort_keys=True) != json.dumps(
+            sanitized,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        return sanitized, changed
 
     # =================================================================
     # Persistence Engine (Snapshot & Delta)
@@ -571,6 +593,7 @@ class MemoryGraph:
             except Exception as e:
                 print(f"❌ Log Replay Error: {e}")
         self._migrate_legacy_claim_scopes()
+        self._migrate_sensitive_boundary_claims_in_persistence()
 
     def _apply_log_entry(self, entry: Dict):
         """로그 한 줄을 메모리에 반영"""
@@ -580,6 +603,8 @@ class MemoryGraph:
         if action == "UPSERT_NODE":
             cat = payload.get("category")
             data = payload.get("data")
+            if not data:
+                return
             node_id = data.get("node_id")
             
             # 객체 복원
@@ -593,7 +618,10 @@ class MemoryGraph:
                 node = NoteNode(**data)
                 self.notes[node_id] = node
             elif cat == "claims":
-                node = ClaimNode(**data)
+                sanitized_data, changed = self._sanitize_persisted_claim_data(data)
+                if changed:
+                    self._boundary_persistence_migration_needed = True
+                node = ClaimNode(**sanitized_data)
                 node.scope = self._normalize_claim_scope(node.scope)
                 self.claims[node_id] = node
             elif cat == "entities":
@@ -619,7 +647,7 @@ class MemoryGraph:
             "episodes": {k: v.to_dict() for k, v in self.episodes.items()},
             "insights": {k: v.to_dict() for k, v in self.insights.items()},
             "notes": {k: v.to_dict() for k, v in self.notes.items()},
-            "claims": {k: v.to_dict() for k, v in self.claims.items()},
+            "claims": {k: self._claim_to_public_graph_payload(v) for k, v in self.claims.items()},
             "entities": {k: v.to_dict() for k, v in self.entities.items()}
         }
         # 임베딩 필드 제거
@@ -657,7 +685,10 @@ class MemoryGraph:
                 for k, v in data.get("notes", {}).items():
                     self.notes[k] = NoteNode(**v)
                 for k, v in data.get("claims", {}).items():
-                    claim = ClaimNode(**v)
+                    sanitized_data, changed = self._sanitize_persisted_claim_data(v)
+                    if changed:
+                        self._boundary_persistence_migration_needed = True
+                    claim = ClaimNode(**sanitized_data)
                     claim.scope = self._normalize_claim_scope(claim.scope)
                     self.claims[k] = claim
                 for k, v in data.get("entities", {}).items():
@@ -691,3 +722,11 @@ class MemoryGraph:
                 claim.scope,
                 inferred_audience_ids=inferred_audience_ids,
             )
+
+    def _migrate_sensitive_boundary_claims_in_persistence(self):
+        if not self._boundary_persistence_migration_needed:
+            return
+        print("🔐 Scrubbing sensitive boundary payloads from graph persistence...")
+        self._save_snapshot()
+        self._clear_log()
+        self._boundary_persistence_migration_needed = False
