@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import re
 import time
 from typing import Any, Dict, List, Optional
@@ -15,11 +16,23 @@ from modules.ltm_graph import MemoryGraph
 class FastPathMemoryWriter:
     """Rule-based write path for high-value explicit state."""
 
-    def __init__(self, graph: MemoryGraph, canonical_store: CanonicalMemoryStore):
+    BOUNDARY_TOPIC_TERMS = {
+        "health": ["병력", "진료", "의료", "의무기록", "기록", "진단", "증상", "치료", "처방", "입원", "복용", "병원", "약"],
+        "finance": ["재정", "지출", "수입", "대출", "카드", "월세", "연봉", "빚", "자산", "통장", "계좌"],
+        "relationship": ["연애", "가족", "친구", "부모", "형제", "동료", "교수", "갈등", "이별", "배우자"],
+        "work_or_study": ["회사", "직장", "업무", "프로젝트", "학교", "시험", "과제", "연구", "평가", "팀"],
+        "privacy": ["사생활", "개인사", "비밀", "프라이버시", "민감한 얘기", "개인 정보"],
+        "personal": ["사생활", "개인사", "민감한 내용", "비밀", "개인 정보"],
+    }
+
+    def __init__(self, graph: MemoryGraph, canonical_store: CanonicalMemoryStore, api_client=None):
         self.graph = graph
         self.store = canonical_store
+        self.api = api_client
         self._processed_barrier_keys: Dict[str, float] = {}
         self._barrier_dedupe_max_entries = int(getattr(config, "BOUNDARY_DEDUPE_MAX_ENTRIES", 2048))
+        self._boundary_embedding_cache: Dict[str, List[float]] = {}
+        self._semantic_threshold = float(getattr(config, "BOUNDARY_SEMANTIC_MATCH_THRESHOLD", 0.78))
 
     def apply_write_barriers(self, log: Optional[Dict], persist: bool = True) -> Optional[Dict]:
         if not log:
@@ -182,11 +195,26 @@ class FastPathMemoryWriter:
                 },
                 qualifiers={
                     "topic_label": barrier["topic_label"],
+                    "semantic_terms": self._topic_semantic_terms(barrier["topic_label"]),
                 },
                 nl_summary=barrier["summary"],
                 confidence=0.98,
                 sensitivity="high",
             )
+
+    def load_active_boundary_rules(self, subject_id: str,
+                                   current_rules: Optional[List[Dict[str, Any]]] = None,
+                                   limit: int = 20) -> List[Dict[str, Any]]:
+        boundary_rules = list(current_rules or [])
+        if self.store and subject_id:
+            claims = self.store.get_active_claims(
+                subject_id=subject_id,
+                facets=[Facet.BOUNDARY_RULE.value],
+                limit=limit,
+                viewer_id=subject_id,
+            )
+            boundary_rules.extend(self._claim_to_runtime_boundary_rule(claim) for claim in claims)
+        return self._dedupe_boundary_rules(boundary_rules)
 
     def sanitize_assistant_memory(self, text: str, boundary_rules: Optional[List[Dict[str, Any]]] = None) -> tuple[str, bool]:
         boundary_rules = boundary_rules or []
@@ -199,8 +227,9 @@ class FastPathMemoryWriter:
 
         sanitized_segments: List[str] = []
         redacted = False
+        segment_embeddings: Dict[str, List[float]] = {}
         for segment in segments:
-            matched_rules = self._match_boundary_rules(segment, boundary_rules)
+            matched_rules = self._match_boundary_rules(segment, boundary_rules, segment_embeddings)
             if matched_rules:
                 sanitized_segments.append(self._build_boundary_placeholder(matched_rules))
                 redacted = True
@@ -210,7 +239,7 @@ class FastPathMemoryWriter:
         sanitized_text = " ".join(segment for segment in sanitized_segments if segment).strip()
         return sanitized_text or text, not redacted
 
-    def _build_boundary_placeholder(self, barriers: List[Dict[str, str]]) -> str:
+    def _build_boundary_placeholder(self, barriers: List[Dict[str, Any]]) -> str:
         kinds = {barrier["kind"] for barrier in barriers}
         if "do_not_store_sensitive" in kinds and "avoid_topic" in kinds:
             return "경계 요청이 있었다. 민감한 내용 저장과 재언급을 피해야 한다."
@@ -242,15 +271,7 @@ class FastPathMemoryWriter:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def _runtime_boundary_rules(self, barriers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        return [
-            {
-                "kind": barrier["kind"],
-                "topic_label": barrier["topic_label"],
-                "target": barrier["target"],
-                "sensitive_tokens": list(barrier.get("sensitive_tokens") or []),
-            }
-            for barrier in barriers
-        ]
+        return [self._to_runtime_boundary_rule(barrier) for barrier in barriers]
 
     def _touch_processed_barrier_key(self, key: str):
         if key in self._processed_barrier_keys:
@@ -263,11 +284,11 @@ class FastPathMemoryWriter:
     def _classify_boundary_topic(self, text: str) -> str:
         normalized = self._normalize_boundary_text(text)
         topic_keywords = {
-            "health": ["건강", "병원", "아프", "치료", "우울", "불안", "진단", "약", "health"],
-            "finance": ["돈", "예산", "카드", "대출", "월세", "연봉", "주식", "빚", "finance"],
-            "relationship": ["연애", "가족", "친구", "부모", "형제", "교수", "동료", "관계", "relationship"],
-            "work_or_study": ["회사", "직장", "업무", "프로젝트", "학교", "시험", "과제", "연구", "work"],
-            "privacy": ["비밀", "개인", "사생활", "프라이버시", "privacy"],
+            "health": self._topic_semantic_terms("health") + ["건강", "health"],
+            "finance": self._topic_semantic_terms("finance") + ["돈", "예산", "finance"],
+            "relationship": self._topic_semantic_terms("relationship") + ["관계", "relationship"],
+            "work_or_study": self._topic_semantic_terms("work_or_study") + ["work", "study"],
+            "privacy": self._topic_semantic_terms("privacy") + ["개인", "privacy"],
         }
         for label, keywords in topic_keywords.items():
             if any(keyword in normalized for keyword in keywords):
@@ -300,14 +321,129 @@ class FastPathMemoryWriter:
             tokens.append(token)
         return list(dict.fromkeys(tokens))
 
-    def _match_boundary_rules(self, text: str, boundary_rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _claim_to_runtime_boundary_rule(self, claim) -> Dict[str, Any]:
+        barrier = {
+            "kind": claim.value.get("kind") or claim.value.get("policy_kind") or "avoid_topic",
+            "topic_label": claim.qualifiers.get("topic_label") or "personal",
+            "target": claim.value.get("target") or "",
+            "sensitive_tokens": list(claim.qualifiers.get("sensitive_tokens") or []),
+            "semantic_terms": list(claim.qualifiers.get("semantic_terms") or []),
+        }
+        return self._to_runtime_boundary_rule(barrier)
+
+    def _to_runtime_boundary_rule(self, barrier: Dict[str, Any]) -> Dict[str, Any]:
+        topic_label = str(barrier.get("topic_label") or "personal")
+        semantic_terms = list(dict.fromkeys(
+            list(barrier.get("semantic_terms") or []) + self._topic_semantic_terms(topic_label)
+        ))
+        rule = {
+            "kind": barrier["kind"],
+            "topic_label": topic_label,
+            "target": barrier.get("target") or "",
+            "sensitive_tokens": list(dict.fromkeys(barrier.get("sensitive_tokens") or [])),
+            "semantic_terms": semantic_terms,
+        }
+        rule["semantic_text"] = self._build_boundary_semantic_text(rule)
+        return rule
+
+    def _dedupe_boundary_rules(self, boundary_rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        merged: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+        for rule in boundary_rules:
+            runtime_rule = self._to_runtime_boundary_rule(rule)
+            key = (
+                str(runtime_rule.get("kind") or ""),
+                str(runtime_rule.get("target") or ""),
+                str(runtime_rule.get("topic_label") or ""),
+            )
+            if key not in merged:
+                merged[key] = runtime_rule
+                continue
+            merged[key]["sensitive_tokens"] = list(dict.fromkeys(
+                merged[key].get("sensitive_tokens", []) + runtime_rule.get("sensitive_tokens", [])
+            ))
+            merged[key]["semantic_terms"] = list(dict.fromkeys(
+                merged[key].get("semantic_terms", []) + runtime_rule.get("semantic_terms", [])
+            ))
+            merged[key]["semantic_text"] = self._build_boundary_semantic_text(merged[key])
+        return list(merged.values())
+
+    def _topic_semantic_terms(self, topic_label: str) -> List[str]:
+        normalized_topic = str(topic_label or "personal").strip().lower()
+        return list(self.BOUNDARY_TOPIC_TERMS.get(normalized_topic, self.BOUNDARY_TOPIC_TERMS["personal"]))
+
+    def _build_boundary_semantic_text(self, rule: Dict[str, Any]) -> str:
+        parts = [
+            str(rule.get("topic_label") or ""),
+            " ".join(rule.get("semantic_terms") or []),
+            " ".join(rule.get("sensitive_tokens") or []),
+        ]
+        return " ".join(part for part in parts if part).strip()
+
+    def _match_boundary_rules(self, text: str, boundary_rules: List[Dict[str, Any]],
+                              segment_embeddings: Optional[Dict[str, List[float]]] = None) -> List[Dict[str, Any]]:
         normalized = self._normalize_boundary_text(text)
         matched: List[Dict[str, Any]] = []
         for rule in boundary_rules:
             tokens = [self._normalize_boundary_text(token) for token in (rule.get("sensitive_tokens") or []) if token]
             if tokens and any(token in normalized for token in tokens):
                 matched.append(rule)
+                continue
+            semantic_terms = [
+                self._normalize_boundary_text(term)
+                for term in (rule.get("semantic_terms") or [])
+                if term
+            ]
+            if semantic_terms and any(term in normalized for term in semantic_terms):
+                matched.append(rule)
+                continue
+            if self._semantic_boundary_match(normalized, rule, segment_embeddings):
+                matched.append(rule)
         return matched
+
+    def _semantic_boundary_match(self, normalized_text: str, rule: Dict[str, Any],
+                                 segment_embeddings: Optional[Dict[str, List[float]]] = None) -> bool:
+        if not self.api or not normalized_text:
+            return False
+
+        semantic_text = str(rule.get("semantic_text") or "").strip()
+        if not semantic_text:
+            return False
+
+        cache_key = normalized_text
+        segment_embeddings = segment_embeddings if segment_embeddings is not None else {}
+        segment_embedding = segment_embeddings.get(cache_key)
+        if segment_embedding is None:
+            segment_embedding = self.api.get_embedding(normalized_text)
+            segment_embeddings[cache_key] = segment_embedding
+
+        rule_embedding = self._boundary_embedding_cache.get(semantic_text)
+        if rule_embedding is None:
+            rule_embedding = self.api.get_embedding(semantic_text)
+            self._boundary_embedding_cache[semantic_text] = rule_embedding
+
+        similarity = self._cosine_similarity(segment_embedding, rule_embedding)
+        return similarity >= self._semantic_threshold_for_rule(rule)
+
+    def _semantic_threshold_for_rule(self, rule: Dict[str, Any]) -> float:
+        topic_label = str(rule.get("topic_label") or "personal").strip().lower()
+        if topic_label == "personal" and not rule.get("sensitive_tokens"):
+            return max(self._semantic_threshold, 0.86)
+        return self._semantic_threshold
+
+    def _cosine_similarity(self, vec_a: Optional[List[float]], vec_b: Optional[List[float]]) -> float:
+        if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+            return 0.0
+
+        dot = 0.0
+        norm_a = 0.0
+        norm_b = 0.0
+        for value_a, value_b in zip(vec_a, vec_b):
+            dot += value_a * value_b
+            norm_a += value_a * value_a
+            norm_b += value_b * value_b
+        if norm_a <= 0.0 or norm_b <= 0.0:
+            return 0.0
+        return dot / math.sqrt(norm_a * norm_b)
 
     def _save_claim(self, subject_id: str, facet: str, value: dict, qualifiers: dict,
                     nl_summary: str, confidence: float,

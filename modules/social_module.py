@@ -290,9 +290,9 @@ class SocialManager:
         }
 
     def _should_score_open_loop_event(self, event: Dict[str, Any]) -> bool:
-        kind = str(event.get("kind") or "").strip().lower()
         source_type = str(event.get("source_type") or "").strip().lower()
-        return source_type == "assistant_commitment" or kind in {"assistant_promise", "followup_needed"}
+        responsible_party = str(event.get("responsible_party") or "").strip().lower()
+        return source_type == "assistant_commitment" or responsible_party == "assistant"
 
     def _compose_fulfillment_deltas(self, event: Dict[str, Any]) -> Dict[str, float]:
         event_type = str(event.get("event_type") or "").strip().lower()

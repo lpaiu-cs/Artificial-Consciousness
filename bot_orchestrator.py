@@ -52,7 +52,7 @@ class BotOrchestrator:
         self.sensory = SensorySystem(self.api)                # Eyes & Ears
         self.stm = WorkingMemory()                            # Short-term Memory
         self.ltm = LongTermMemory(self.ltm_graph, self.api, self.canonical_store)   # Long-term Memory Retrieval
-        self.fast_path_writer = FastPathMemoryWriter(self.ltm_graph, self.canonical_store)
+        self.fast_path_writer = FastPathMemoryWriter(self.ltm_graph, self.canonical_store, self.api)
         self.canonical_store.set_open_loop_listener(self.social.handle_open_loop_event)
         
         # 3. Background Process
@@ -76,8 +76,12 @@ class BotOrchestrator:
         raw_user_input = calling_message.get("msg", "")
         sanitized_history = [self.fast_path_writer.apply_write_barriers(log, persist=False) for log in history]
         sanitized_message = self.fast_path_writer.apply_write_barriers(calling_message, persist=True)
-        boundary_rules = list((sanitized_message or {}).get("boundary_rules") or [])
-        boundary_requested = bool(boundary_rules)
+        current_boundary_rules = list((sanitized_message or {}).get("boundary_rules") or [])
+        boundary_requested = bool(current_boundary_rules)
+        enforcement_boundary_rules = self.fast_path_writer.load_active_boundary_rules(
+            user_id,
+            current_rules=current_boundary_rules,
+        )
         
         # -------------------------------------------------------
         # Phase 1: Perception (지각)
@@ -120,7 +124,7 @@ class BotOrchestrator:
             relationship_desc,
             session_state,
             boundary_requested=boundary_requested,
-            boundary_rules=boundary_rules,
+            boundary_rules=enforcement_boundary_rules,
         )
         
         return response
