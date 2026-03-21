@@ -77,7 +77,6 @@ class BotOrchestrator:
         sanitized_history = [self.fast_path_writer.apply_write_barriers(log, persist=False) for log in history]
         sanitized_message = self.fast_path_writer.apply_write_barriers(calling_message, persist=True)
         current_boundary_rules = list((sanitized_message or {}).get("boundary_rules") or [])
-        boundary_requested = bool(current_boundary_rules)
         enforcement_boundary_rules = self.fast_path_writer.load_active_boundary_rules(
             user_id,
             current_rules=current_boundary_rules,
@@ -123,7 +122,7 @@ class BotOrchestrator:
             context_summary,
             relationship_desc,
             session_state,
-            boundary_requested=boundary_requested,
+            boundary_checked=bool(enforcement_boundary_rules),
             boundary_rules=enforcement_boundary_rules,
         )
         
@@ -224,7 +223,7 @@ class BotOrchestrator:
         return self._run_fast_reconstruction(stm_context, memory_context, current_user_id)
 
     def _act(self, user_id, user_input, context_summary, relationship_desc,
-             session_state: Dict[str, Any], boundary_requested: bool = False,
+             session_state: Dict[str, Any], boundary_checked: bool = False,
              boundary_rules: List[Dict[str, Any]] | None = None) -> str:
         """
         [Action & Feedback Loop]
@@ -234,16 +233,25 @@ class BotOrchestrator:
         response_text, natural_emotion = self._run_slow_generation(
             user_input, context_summary, relationship_desc, session_state["current_mood"]
         )
-        memory_safe_response, boundary_respected = self.fast_path_writer.sanitize_assistant_memory(
+        boundary_relevant = self.fast_path_writer.evaluate_boundary_relevance(
+            user_input,
+            boundary_rules=boundary_rules,
+        )
+        boundary_enforcement = self.fast_path_writer.enforce_assistant_boundaries(
             response_text,
             boundary_rules=boundary_rules,
         )
+        boundary_relevant = boundary_relevant or bool(boundary_enforcement["boundary_relevant"])
+        boundary_violated = bool(boundary_enforcement["boundary_violated"])
+        boundary_respected = bool(boundary_checked and boundary_relevant and not boundary_violated)
+        memory_safe_response = boundary_enforcement["memory_safe_text"]
+        visible_response_text = boundary_enforcement["user_visible_text"]
         
         # 2. Feedback Loop
         # (A) 현재 사용자 세션 기분 업데이트
         session_state["current_mood"] = natural_emotion
         session_state["last_user_input"] = user_input
-        session_state["last_assistant_response"] = response_text
+        session_state["last_assistant_response"] = visible_response_text
         session_state["last_assistant_memory_text"] = memory_safe_response
         session_state["updated_at"] = time.time()
         
@@ -252,10 +260,12 @@ class BotOrchestrator:
         self.social.update_relationship(
             user_id,
             user_text=user_input,
-            assistant_text=response_text,
+            assistant_text=visible_response_text,
             user_embedding=interaction_signal_vec,
-            boundary_requested=boundary_requested,
+            boundary_checked=boundary_checked,
+            boundary_relevant=boundary_relevant,
             boundary_respected=boundary_respected,
+            boundary_violated=boundary_violated,
         )
         
         # (C) 자가 기억(Self-Memory) STM 저장. 감정 태그 보존!
@@ -271,7 +281,7 @@ class BotOrchestrator:
         self.stm.inject_memories([bot_mem])
         self.reflector.submit_memories([bot_mem])
         
-        return response_text
+        return visible_response_text
 
     def _get_session_state(self, user_id: str) -> Dict[str, Any]:
         state = self.session_states.setdefault(

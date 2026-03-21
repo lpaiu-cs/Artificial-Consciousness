@@ -109,8 +109,10 @@ class SocialManager:
 
     def update_relationship(self, user_id: str, user_text: str, assistant_text: str = "",
                             user_embedding: Optional[list] = None,
-                            boundary_requested: bool = False,
-                            boundary_respected: bool = False) -> Dict[str, float]:
+                            boundary_checked: bool = False,
+                            boundary_relevant: bool = False,
+                            boundary_respected: bool = False,
+                            boundary_violated: bool = False) -> Dict[str, float]:
         """
         [Event-centric Relation Update]
         톤 유사도는 약한 베이스 신호로 쓰고, 감사/불만/수정/repair/boundary respect 같은
@@ -123,8 +125,10 @@ class SocialManager:
         signals = self._extract_interaction_signals(
             user_text=user_text,
             assistant_text=assistant_text,
-            boundary_requested=boundary_requested,
+            boundary_checked=boundary_checked,
+            boundary_relevant=boundary_relevant,
             boundary_respected=boundary_respected,
+            boundary_violated=boundary_violated,
         )
         deltas = self._compose_relation_deltas(similarity, signals)
         self._apply_relation_update(user_id, deltas)
@@ -184,8 +188,10 @@ class SocialManager:
         return float(np.dot(a, b) / (norm_a * norm_b))
 
     def _extract_interaction_signals(self, user_text: str, assistant_text: str,
-                                     boundary_requested: bool,
-                                     boundary_respected: bool) -> Dict[str, float]:
+                                     boundary_checked: bool,
+                                     boundary_relevant: bool,
+                                     boundary_respected: bool,
+                                     boundary_violated: bool) -> Dict[str, float]:
         user = (user_text or "").lower()
         assistant = (assistant_text or "").lower()
 
@@ -220,8 +226,10 @@ class SocialManager:
             "gratitude": float(gratitude),
             "praise": float(praise),
             "trust": float(trust),
-            "boundary_requested": float(boundary_requested),
+            "boundary_checked": float(boundary_checked),
+            "boundary_relevant": float(boundary_relevant),
             "boundary_respected": float(boundary_respected),
+            "boundary_violated": float(boundary_violated),
             "repair": float(assistant_repair and (complaint or correction)),
         }
 
@@ -236,6 +244,7 @@ class SocialManager:
         trust_signal = signals.get("trust", 0.0)
         repair = signals.get("repair", 0.0)
         boundary_respected = signals.get("boundary_respected", 0.0)
+        boundary_violated = signals.get("boundary_violated", 0.0)
 
         return {
             "affinity": (
@@ -247,6 +256,7 @@ class SocialManager:
                 + boundary_respected * 0.5
                 - complaint * 1.3
                 - correction * 0.8
+                - boundary_violated * 1.1
             ),
             "warmth": (
                 positive_tone * 0.03
@@ -254,6 +264,7 @@ class SocialManager:
                 + gratitude * 0.08
                 + praise * 0.05
                 - complaint * 0.04
+                - boundary_violated * 0.03
             ),
             "trust": (
                 gratitude * 0.03
@@ -262,6 +273,7 @@ class SocialManager:
                 + repair * 0.05
                 - complaint * 0.03
                 - correction * 0.02
+                - boundary_violated * 0.08
             ),
             "familiarity": (
                 0.025
@@ -273,11 +285,13 @@ class SocialManager:
                 + boundary_respected * 0.06
                 + repair * 0.05
                 - complaint * 0.015
+                - boundary_violated * 0.08
             ),
             "tension": (
                 negative_tone * 0.02
                 + complaint * 0.08
                 + correction * 0.05
+                + boundary_violated * 0.08
                 - repair * 0.08
                 - gratitude * 0.02
             ),
@@ -286,6 +300,7 @@ class SocialManager:
                 + repair * 0.05
                 - complaint * 0.03
                 - correction * 0.04
+                - boundary_violated * 0.08
             ),
         }
 

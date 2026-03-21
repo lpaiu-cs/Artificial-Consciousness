@@ -195,6 +195,7 @@ class FastPathMemoryWriter:
                 },
                 qualifiers={
                     "topic_label": barrier["topic_label"],
+                    "sensitive_tokens": list(barrier.get("sensitive_tokens") or []),
                     "semantic_terms": self._topic_semantic_terms(barrier["topic_label"]),
                 },
                 nl_summary=barrier["summary"],
@@ -216,28 +217,76 @@ class FastPathMemoryWriter:
             boundary_rules.extend(self._claim_to_runtime_boundary_rule(claim) for claim in claims)
         return self._dedupe_boundary_rules(boundary_rules)
 
-    def sanitize_assistant_memory(self, text: str, boundary_rules: Optional[List[Dict[str, Any]]] = None) -> tuple[str, bool]:
-        boundary_rules = boundary_rules or []
+    def evaluate_boundary_relevance(self, text: str,
+                                    boundary_rules: Optional[List[Dict[str, Any]]] = None) -> bool:
+        boundary_rules = self._dedupe_boundary_rules(boundary_rules or [])
         if not text or not boundary_rules:
-            return text, False
+            return False
+
+        segment_embeddings: Dict[str, List[float]] = {}
+        for segment in self._segment_text(text):
+            if self._match_boundary_rules(segment, boundary_rules, segment_embeddings):
+                return True
+        return False
+
+    def enforce_assistant_boundaries(self, text: str,
+                                     boundary_rules: Optional[List[Dict[str, Any]]] = None,
+                                     repair_user_visible: bool = True) -> Dict[str, Any]:
+        boundary_rules = self._dedupe_boundary_rules(boundary_rules or [])
+        result = {
+            "boundary_checked": bool(boundary_rules),
+            "boundary_relevant": False,
+            "boundary_respected": False,
+            "boundary_violated": False,
+            "memory_safe_text": text,
+            "user_visible_text": text,
+            "matched_rules": [],
+        }
+        if not text or not boundary_rules:
+            return result
 
         segments = self._segment_text(text)
         if not segments:
-            return text, False
+            return result
 
         sanitized_segments: List[str] = []
-        redacted = False
         segment_embeddings: Dict[str, List[float]] = {}
+        matched_rule_map: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+
         for segment in segments:
             matched_rules = self._match_boundary_rules(segment, boundary_rules, segment_embeddings)
             if matched_rules:
+                result["boundary_relevant"] = True
+                result["boundary_violated"] = True
+                for rule in matched_rules:
+                    key = (
+                        str(rule.get("kind") or ""),
+                        str(rule.get("target") or ""),
+                        str(rule.get("topic_label") or ""),
+                    )
+                    matched_rule_map[key] = rule
                 sanitized_segments.append(self._build_boundary_placeholder(matched_rules))
-                redacted = True
             else:
                 sanitized_segments.append(segment)
 
-        sanitized_text = " ".join(segment for segment in sanitized_segments if segment).strip()
-        return sanitized_text or text, not redacted
+        if not result["boundary_violated"]:
+            return result
+
+        sanitized_text = " ".join(segment for segment in sanitized_segments if segment).strip() or text
+        result["memory_safe_text"] = sanitized_text
+        result["user_visible_text"] = sanitized_text if repair_user_visible else text
+        result["matched_rules"] = list(matched_rule_map.values())
+        return result
+
+    def sanitize_assistant_memory(self, text: str, boundary_rules: Optional[List[Dict[str, Any]]] = None) -> tuple[str, bool]:
+        enforcement = self.enforce_assistant_boundaries(
+            text,
+            boundary_rules=boundary_rules,
+            repair_user_visible=False,
+        )
+        return enforcement["memory_safe_text"], bool(
+            enforcement["boundary_checked"] and not enforcement["boundary_violated"]
+        )
 
     def _build_boundary_placeholder(self, barriers: List[Dict[str, Any]]) -> str:
         kinds = {barrier["kind"] for barrier in barriers}
