@@ -5,11 +5,13 @@ modules/__pycache__/
 
 # runtime
 api_logs.jsonl
+sensory_seen_logs.json
 
 # test 관련 로직.
-/tests/
-run_tests.py
-pytest.ini
+/tests/*
+!/tests/__init__.py
+!/tests/conftest.py
+!/tests/test_smoke_suite.py
 demo_api_logging.py
 
 # secrets

@@ -12,9 +12,12 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 # Model Config
 EMBEDDING_MODEL = "text-embedding-3-small"
-SMART_MODEL = "gpt-4o"
-FAST_MODEL = "llama-3.1-8b-instant"
+SMART_MODEL = os.getenv("SMART_MODEL", "gpt-4o-2024-11-20")
+FAST_MODEL = os.getenv("FAST_MODEL", "llama-3.1-8b-instant")
 # FAST_MODEL = "llama-3.1-70b-versatile"
+MODEL_EVAL_GATE_ENABLED = os.getenv("MODEL_EVAL_GATE_ENABLED", "true").lower() not in {"0", "false", "no", "off"}
+MODEL_EVAL_GATE_ENFORCE = os.getenv("MODEL_EVAL_GATE_ENFORCE", "true").lower() not in {"0", "false", "no", "off"}
+MODEL_EVAL_GATE_PATH = os.getenv("MODEL_EVAL_GATE_PATH", "model_eval_gate.json")
 
 # Memory Config
 STM_CAPACITY = 15
@@ -64,6 +67,9 @@ SENSORY_CURSOR_HMAC_KEY = os.getenv("SENSORY_CURSOR_HMAC_KEY", "")  # cursor dig
 BOUNDARY_DEDUPE_MAX_ENTRIES = 2048             # in-memory boundary dedupe 최대 유지 개수
 REFERENT_CACHE_MAX_ENTRIES = 6                 # 세션 referent cache 최대 유지 개수
 BOUNDARY_SEMANTIC_MATCH_THRESHOLD = 0.78       # boundary 의미 유사도 기반 redaction 임계치
+BOUNDARY_SEMANTIC_MAX_CANDIDATES = 4           # 턴당 semantic fallback 비교 후보 수 상한
+BOUNDARY_SEGMENT_EMBED_CACHE_MAX = 256         # segment embedding cache 최대 유지 개수
+BOUNDARY_SEMANTIC_RESULT_CACHE_MAX = 2048      # semantic match result cache 최대 유지 개수
 
 # Social Update Config
 # 이 감정과 가까울수록 호감도가 오르고, 멀수록(반대일수록) 호감도가 떨어집니다.

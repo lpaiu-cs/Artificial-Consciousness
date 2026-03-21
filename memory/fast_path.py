@@ -33,7 +33,12 @@ class FastPathMemoryWriter:
         self._processed_barrier_keys: Dict[str, float] = {}
         self._barrier_dedupe_max_entries = int(getattr(config, "BOUNDARY_DEDUPE_MAX_ENTRIES", 2048))
         self._boundary_embedding_cache: Dict[str, List[float]] = {}
+        self._segment_embedding_cache: Dict[str, List[float]] = {}
+        self._semantic_match_cache: Dict[str, bool] = {}
         self._semantic_threshold = float(getattr(config, "BOUNDARY_SEMANTIC_MATCH_THRESHOLD", 0.78))
+        self._semantic_max_candidates = int(getattr(config, "BOUNDARY_SEMANTIC_MAX_CANDIDATES", 4))
+        self._segment_embedding_cache_max = int(getattr(config, "BOUNDARY_SEGMENT_EMBED_CACHE_MAX", 256))
+        self._semantic_result_cache_max = int(getattr(config, "BOUNDARY_SEMANTIC_RESULT_CACHE_MAX", 2048))
 
     def apply_write_barriers(self, log: Optional[Dict], persist: bool = True) -> Optional[Dict]:
         if not log:
@@ -518,6 +523,7 @@ class FastPathMemoryWriter:
                               target_scope_confirmed: bool = False) -> List[Dict[str, Any]]:
         normalized = self._normalize_boundary_text(text)
         matched: List[Dict[str, Any]] = []
+        semantic_candidates: List[tuple[int, Dict[str, Any]]] = []
         for rule in boundary_rules:
             if not target_scope_confirmed and not self._match_rule_target_scope(normalized, rule):
                 continue
@@ -533,9 +539,49 @@ class FastPathMemoryWriter:
             if semantic_terms and any(term in normalized for term in semantic_terms):
                 matched.append(rule)
                 continue
+            semantic_score = self._semantic_candidate_score(normalized, rule)
+            if semantic_score > 0 or len(boundary_rules) <= 2:
+                semantic_candidates.append((semantic_score, rule))
+
+        semantic_limit = self._semantic_candidate_limit(semantic_candidates)
+        for _, rule in semantic_candidates[:semantic_limit]:
             if self._semantic_boundary_match(normalized, rule, segment_embeddings):
                 matched.append(rule)
         return matched
+
+    def _semantic_candidate_score(self, normalized_text: str, rule: Dict[str, Any]) -> int:
+        score = 0
+        topic_label = self._normalize_boundary_text(rule.get("topic_label") or "")
+        if topic_label and topic_label != "personal" and topic_label in normalized_text:
+            score += 1
+
+        for token in (rule.get("sensitive_tokens") or []):
+            normalized_token = self._normalize_boundary_text(token)
+            if len(normalized_token) >= 2 and normalized_token[:2] in normalized_text:
+                score += 2
+                break
+
+        for alias in (rule.get("target_aliases") or []):
+            normalized_alias = self._normalize_boundary_text(alias)
+            if len(normalized_alias) >= 2 and normalized_alias[:2] in normalized_text:
+                score += 2
+                break
+
+        for role in (rule.get("target_roles") or []):
+            normalized_role = self._normalize_boundary_text(role)
+            if len(normalized_role) >= 2 and normalized_role[:2] in normalized_text:
+                score += 1
+                break
+
+        return score
+
+    def _semantic_candidate_limit(self, semantic_candidates: List[tuple[int, Dict[str, Any]]]) -> int:
+        if not semantic_candidates:
+            return 0
+        semantic_candidates.sort(key=lambda item: item[0], reverse=True)
+        if any(score > 0 for score, _ in semantic_candidates):
+            return min(len(semantic_candidates), max(self._semantic_max_candidates, 0))
+        return min(len(semantic_candidates), 1)
 
     def summarize_boundary_rules(self, boundary_rules: Optional[List[Dict[str, Any]]] = None,
                                  limit: int = 6) -> List[str]:
@@ -740,11 +786,25 @@ class FastPathMemoryWriter:
         if not semantic_text:
             return False
 
+        semantic_cache_key = f"{normalized_text}::{semantic_text}"
+        cached_result = self._cache_lookup(self._semantic_match_cache, semantic_cache_key)
+        if cached_result is not None:
+            return bool(cached_result)
+
         cache_key = normalized_text
         segment_embeddings = segment_embeddings if segment_embeddings is not None else {}
         segment_embedding = segment_embeddings.get(cache_key)
         if segment_embedding is None:
+            segment_embedding = self._cache_lookup(self._segment_embedding_cache, cache_key)
+        if segment_embedding is None:
             segment_embedding = self.api.get_embedding(normalized_text)
+            self._cache_store(
+                self._segment_embedding_cache,
+                cache_key,
+                segment_embedding,
+                self._segment_embedding_cache_max,
+            )
+        if segment_embeddings.get(cache_key) is None:
             segment_embeddings[cache_key] = segment_embedding
 
         rule_embedding = self._boundary_embedding_cache.get(semantic_text)
@@ -753,7 +813,14 @@ class FastPathMemoryWriter:
             self._boundary_embedding_cache[semantic_text] = rule_embedding
 
         similarity = self._cosine_similarity(segment_embedding, rule_embedding)
-        return similarity >= self._semantic_threshold_for_rule(rule)
+        matched = similarity >= self._semantic_threshold_for_rule(rule)
+        self._cache_store(
+            self._semantic_match_cache,
+            semantic_cache_key,
+            matched,
+            self._semantic_result_cache_max,
+        )
+        return matched
 
     def _semantic_threshold_for_rule(self, rule: Dict[str, Any]) -> float:
         topic_label = str(rule.get("topic_label") or "personal").strip().lower()
@@ -775,6 +842,23 @@ class FastPathMemoryWriter:
         if norm_a <= 0.0 or norm_b <= 0.0:
             return 0.0
         return dot / math.sqrt(norm_a * norm_b)
+
+    def _cache_lookup(self, cache: Dict[str, Any], key: str):
+        if key not in cache:
+            return None
+        value = cache.pop(key)
+        cache[key] = value
+        return value
+
+    def _cache_store(self, cache: Dict[str, Any], key: str, value: Any, max_entries: int):
+        if max_entries <= 0:
+            return
+        if key in cache:
+            cache.pop(key, None)
+        cache[key] = value
+        while len(cache) > max_entries:
+            oldest_key = next(iter(cache))
+            cache.pop(oldest_key, None)
 
     def _save_claim(self, subject_id: str, facet: str, value: dict, qualifiers: dict,
                     nl_summary: str, confidence: float,

@@ -149,6 +149,7 @@ class UnifiedAPIClient:
     def __init__(self, enable_logging: bool = None, exclude_embedding_log: bool = None):
         # Logger 초기화
         self.logger = APILogger(enabled=enable_logging, exclude_embedding=exclude_embedding_log)
+        self._validate_model_eval_gate()
         
         # 1. OpenAI Init
         if config.OPENAI_API_KEY:
@@ -163,6 +164,74 @@ class UnifiedAPIClient:
         else:
             logging.warning("⚠️ Groq API Key is missing.")
             self.groq_client = None
+
+    def _config_bool(self, name: str, default: bool) -> bool:
+        value = getattr(config, name, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+        return default
+
+    def _config_str(self, name: str, default: str) -> str:
+        value = getattr(config, name, default)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return default
+
+    def _validate_model_eval_gate(self):
+        if not self._config_bool("MODEL_EVAL_GATE_ENABLED", False):
+            return
+
+        gate_path = os.path.abspath(os.path.expanduser(
+            self._config_str("MODEL_EVAL_GATE_PATH", "model_eval_gate.json")
+        ))
+        enforce = self._config_bool("MODEL_EVAL_GATE_ENFORCE", True)
+        if not os.path.exists(gate_path):
+            message = f"Model eval gate file is missing: {gate_path}"
+            if enforce:
+                raise RuntimeError(message)
+            logging.warning(message)
+            return
+
+        try:
+            with open(gate_path, "r", encoding="utf-8") as handle:
+                gate = json.load(handle)
+        except Exception as exc:
+            message = f"Failed to load model eval gate: {exc}"
+            if enforce:
+                raise RuntimeError(message) from exc
+            logging.warning(message)
+            return
+
+        approved = gate.get("models", {})
+        current = {
+            "embedding": self._config_str("EMBEDDING_MODEL", ""),
+            "smart": self._config_str("SMART_MODEL", ""),
+            "fast": self._config_str("FAST_MODEL", ""),
+        }
+        mismatches = {
+            name: {"approved": approved.get(name), "current": model}
+            for name, model in current.items()
+            if approved.get(name) and model and approved.get(name) != model
+        }
+        if not mismatches:
+            return
+
+        mismatch_text = ", ".join(
+            f"{name}: approved={details['approved']} current={details['current']}"
+            for name, details in mismatches.items()
+        )
+        message = f"Model eval gate rejected unapproved model configuration ({mismatch_text})"
+        if enforce:
+            raise RuntimeError(message)
+        logging.warning(message)
     
     def set_logging(self, enabled: bool):
         """로깅 on/off (테스트용)"""
