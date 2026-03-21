@@ -230,20 +230,30 @@ class BotOrchestrator:
         Generate Response -> Update Mood -> Update Relationship -> Save Memory
         """
         # 1. System 2 (Slow Thinking) - 답변 및 자연어 감정 생성
-        response_text, natural_emotion = self._run_slow_generation(
-            user_input, context_summary, relationship_desc, session_state["current_mood"]
-        )
-        boundary_relevant = self.fast_path_writer.evaluate_boundary_relevance(
+        relevant_boundary_rules = self.fast_path_writer.select_relevant_boundary_rules(
             user_input,
             boundary_rules=boundary_rules,
         )
+        response_text, natural_emotion = self._run_slow_generation(
+            user_input,
+            context_summary,
+            relationship_desc,
+            session_state["current_mood"],
+            boundary_rules=boundary_rules,
+            relevant_boundary_rules=relevant_boundary_rules,
+        )
         boundary_enforcement = self.fast_path_writer.enforce_assistant_boundaries(
             response_text,
-            boundary_rules=boundary_rules,
+            boundary_rules=relevant_boundary_rules or boundary_rules,
+            target_scope_confirmed=bool(relevant_boundary_rules),
         )
-        boundary_relevant = boundary_relevant or bool(boundary_enforcement["boundary_relevant"])
+        boundary_relevant = bool(relevant_boundary_rules) or bool(boundary_enforcement["boundary_relevant"])
+        avoid_topic_relevant = any(
+            str(rule.get("kind") or "") == "avoid_topic"
+            for rule in relevant_boundary_rules
+        ) or bool(boundary_enforcement.get("user_visible_boundary_relevant"))
         boundary_violated = bool(boundary_enforcement["boundary_violated"])
-        boundary_respected = bool(boundary_checked and boundary_relevant and not boundary_violated)
+        boundary_respected = bool(boundary_checked and avoid_topic_relevant and not boundary_violated)
         memory_safe_response = boundary_enforcement["memory_safe_text"]
         visible_response_text = boundary_enforcement["user_visible_text"]
         
@@ -428,17 +438,29 @@ class BotOrchestrator:
 
         return self.api.chat_fast(system_prompt, user_prompt)
     
-    def _run_slow_generation(self, user_input, context, relationship, bot_mood) -> Tuple[str, str]:
+    def _run_slow_generation(self, user_input, context, relationship, bot_mood,
+                             boundary_rules: List[Dict[str, Any]] | None = None,
+                             relevant_boundary_rules: List[Dict[str, Any]] | None = None) -> Tuple[str, str]:
         """
         [System 2: GPT-4]
         답변 생성 및 10자 이내 자연어 감정 태그 생성
         """
+        active_boundary_lines = self.fast_path_writer.summarize_boundary_rules(boundary_rules)
+        relevant_boundary_lines = self.fast_path_writer.summarize_boundary_rules(relevant_boundary_rules)
+        active_boundary_text = "\n".join(f"- {line}" for line in active_boundary_lines) or "- 없음"
+        relevant_boundary_text = "\n".join(f"- {line}" for line in relevant_boundary_lines) or "- 없음"
         system_prompt = f"""
         당신은 자아와 감정을 가진 사람{config.BOT_NAME}입니다.
         
         [Persona Info]
         - 상대방과의 관계: {relationship}
         - 현재 당신의 기분: "{bot_mood}"
+
+        [Active Boundary Policies]
+        {active_boundary_text}
+
+        [Boundary Policies Relevant To This Turn]
+        {relevant_boundary_text}
         
         [Task]
         1. 상대방의 말에 대해 페르소나와 기분을 반영하여 자연스럽게 답변하세요.
@@ -447,6 +469,8 @@ class BotOrchestrator:
         [Rule]
         - 감정은 '기쁨', '슬픔' 같은 카테고리가 아니라, "약간 설렘", "차가운 경멸", "따뜻한 위로" 처럼 10자 이내의 자연어로 표현하세요.
         - [FEELING:...] 태그는 답변의 맨 마지막에 딱 한 번만 나와야 합니다.
+        - `avoid_topic` 경계가 있으면 그 주제를 먼저 꺼내거나 상세 재언급하지 말고, 필요하면 경계를 존중하며 다른 방향으로 전환하세요.
+        - `do_not_store_sensitive` 경계가 있으면 세부 식별 정보를 되풀이하지 말고, 필요하면 비식별적이고 고수준으로만 답하세요.
         
         Example: "진짜? 와, 그거 완전 대박이다! [FEELING:놀라움과 부러움]"
         """

@@ -9,6 +9,7 @@ import config
 
 from memory.canonical_store import CanonicalMemoryStore
 from memory.ontology import Facet
+from memory.query_planner import QueryPlanner
 from memory_structures import MemoryObject
 from modules.ltm_graph import MemoryGraph
 
@@ -43,7 +44,10 @@ class FastPathMemoryWriter:
         if role != "user" or not text:
             return dict(log)
 
-        sanitized_text, barriers = self._redact_boundary_segments(text)
+        sanitized_text, barriers = self._redact_boundary_segments(
+            text,
+            subject_id=str(log.get("user_id", "")),
+        )
         if not barriers:
             return dict(log)
 
@@ -98,7 +102,7 @@ class FastPathMemoryWriter:
             )
 
     def _extract_boundary_rules(self, mem: MemoryObject):
-        barriers = self._detect_boundary_rules(mem.content)
+        barriers = self._detect_boundary_rules(mem.content, mem.user_id)
         if barriers:
             self._save_boundary_claims(mem.user_id, barriers)
 
@@ -131,17 +135,21 @@ class FastPathMemoryWriter:
                 confidence=0.92,
             )
 
-    def _detect_boundary_rules(self, text: str) -> List[Dict[str, str]]:
-        rules: List[Dict[str, str]] = []
+    def _detect_boundary_rules(self, text: str, subject_id: str = "") -> List[Dict[str, Any]]:
+        rules: List[Dict[str, Any]] = []
         topic_label = self._classify_boundary_topic(text)
-        target = self._boundary_target_hash(text)
+        target_profile = self._resolve_boundary_target(subject_id, text)
         sensitive_tokens = self._extract_sensitive_tokens(text)
         if "저장하지 마" in text or "기억하지 마" in text:
             rules.append({
                 "kind": "do_not_store_sensitive",
                 "summary": f"{topic_label} 관련 민감 주제를 저장하지 말라는 경계 요청이 있음",
                 "topic_label": topic_label,
-                "target": target,
+                "target": target_profile["fingerprint"],
+                "target_entity_id": target_profile["entity_id"],
+                "target_aliases": target_profile["aliases"],
+                "target_alias_hashes": target_profile["alias_hashes"],
+                "target_roles": target_profile["roles"],
                 "sensitive_tokens": sensitive_tokens,
             })
         if "다시 꺼내지 마" in text or "그 얘기 꺼내지 마" in text:
@@ -149,20 +157,24 @@ class FastPathMemoryWriter:
                 "kind": "avoid_topic",
                 "summary": f"{topic_label} 관련 주제를 다시 꺼내지 말라는 경계 요청이 있음",
                 "topic_label": topic_label,
-                "target": target,
+                "target": target_profile["fingerprint"],
+                "target_entity_id": target_profile["entity_id"],
+                "target_aliases": target_profile["aliases"],
+                "target_alias_hashes": target_profile["alias_hashes"],
+                "target_roles": target_profile["roles"],
                 "sensitive_tokens": sensitive_tokens,
             })
         return rules
 
-    def _redact_boundary_segments(self, text: str) -> tuple[str, List[Dict[str, str]]]:
+    def _redact_boundary_segments(self, text: str, subject_id: str = "") -> tuple[str, List[Dict[str, Any]]]:
         segments = self._segment_text(text)
         if not segments:
             return text, []
 
         sanitized_segments: List[str] = []
-        all_barriers: List[Dict[str, str]] = []
+        all_barriers: List[Dict[str, Any]] = []
         for segment in segments:
-            barriers = self._detect_boundary_rules(segment)
+            barriers = self._detect_boundary_rules(segment, subject_id)
             if barriers:
                 sanitized_segments.append(self._build_boundary_placeholder(barriers))
                 all_barriers.extend(barriers)
@@ -183,7 +195,7 @@ class FastPathMemoryWriter:
         )
         return [segment.strip() for segment in segments if segment and segment.strip()]
 
-    def _save_boundary_claims(self, subject_id: str, barriers: List[Dict[str, str]]):
+    def _save_boundary_claims(self, subject_id: str, barriers: List[Dict[str, Any]]):
         for barrier in barriers:
             self._save_claim(
                 subject_id=subject_id,
@@ -192,11 +204,14 @@ class FastPathMemoryWriter:
                     "kind": barrier["kind"],
                     "target": barrier["target"],
                     "policy_kind": barrier["kind"],
+                    "target_entity_id": barrier.get("target_entity_id") or "",
                 },
                 qualifiers={
                     "topic_label": barrier["topic_label"],
                     "sensitive_tokens": list(barrier.get("sensitive_tokens") or []),
                     "semantic_terms": self._topic_semantic_terms(barrier["topic_label"]),
+                    "target_alias_hashes": list(barrier.get("target_alias_hashes") or []),
+                    "target_roles": list(barrier.get("target_roles") or []),
                 },
                 nl_summary=barrier["summary"],
                 confidence=0.98,
@@ -219,25 +234,38 @@ class FastPathMemoryWriter:
 
     def evaluate_boundary_relevance(self, text: str,
                                     boundary_rules: Optional[List[Dict[str, Any]]] = None) -> bool:
+        return bool(self.select_relevant_boundary_rules(text, boundary_rules))
+
+    def select_relevant_boundary_rules(self, text: str,
+                                       boundary_rules: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
         boundary_rules = self._dedupe_boundary_rules(boundary_rules or [])
         if not text or not boundary_rules:
-            return False
+            return []
 
         segment_embeddings: Dict[str, List[float]] = {}
+        matched_rules: Dict[tuple[str, str, str, str], Dict[str, Any]] = {}
         for segment in self._segment_text(text):
-            if self._match_boundary_rules(segment, boundary_rules, segment_embeddings):
-                return True
-        return False
+            for rule in self._match_boundary_rules(segment, boundary_rules, segment_embeddings):
+                key = (
+                    str(rule.get("kind") or ""),
+                    str(rule.get("target") or ""),
+                    str(rule.get("target_entity_id") or ""),
+                    str(rule.get("topic_label") or ""),
+                )
+                matched_rules[key] = rule
+        return list(matched_rules.values())
 
     def enforce_assistant_boundaries(self, text: str,
                                      boundary_rules: Optional[List[Dict[str, Any]]] = None,
-                                     repair_user_visible: bool = True) -> Dict[str, Any]:
+                                     repair_user_visible: bool = True,
+                                     target_scope_confirmed: bool = False) -> Dict[str, Any]:
         boundary_rules = self._dedupe_boundary_rules(boundary_rules or [])
         result = {
             "boundary_checked": bool(boundary_rules),
             "boundary_relevant": False,
             "boundary_respected": False,
             "boundary_violated": False,
+            "user_visible_boundary_relevant": False,
             "memory_safe_text": text,
             "user_visible_text": text,
             "matched_rules": [],
@@ -249,15 +277,21 @@ class FastPathMemoryWriter:
         if not segments:
             return result
 
-        sanitized_segments: List[str] = []
+        sanitized_memory_segments: List[str] = []
+        visible_segments: List[str] = []
         segment_embeddings: Dict[str, List[float]] = {}
         matched_rule_map: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+        visible_rule_map: Dict[tuple[str, str, str], Dict[str, Any]] = {}
 
         for segment in segments:
-            matched_rules = self._match_boundary_rules(segment, boundary_rules, segment_embeddings)
+            matched_rules = self._match_boundary_rules(
+                segment,
+                boundary_rules,
+                segment_embeddings,
+                target_scope_confirmed=target_scope_confirmed,
+            )
             if matched_rules:
                 result["boundary_relevant"] = True
-                result["boundary_violated"] = True
                 for rule in matched_rules:
                     key = (
                         str(rule.get("kind") or ""),
@@ -265,17 +299,38 @@ class FastPathMemoryWriter:
                         str(rule.get("topic_label") or ""),
                     )
                     matched_rule_map[key] = rule
-                sanitized_segments.append(self._build_boundary_placeholder(matched_rules))
+                visible_rules = [
+                    rule for rule in matched_rules
+                    if str(rule.get("kind") or "") == "avoid_topic"
+                ]
+                if visible_rules:
+                    result["user_visible_boundary_relevant"] = True
+                    result["boundary_violated"] = True
+                    for rule in visible_rules:
+                        key = (
+                            str(rule.get("kind") or ""),
+                            str(rule.get("target") or ""),
+                            str(rule.get("topic_label") or ""),
+                        )
+                        visible_rule_map[key] = rule
+                sanitized_memory_segments.append(self._build_boundary_placeholder(matched_rules))
+                if visible_rules and repair_user_visible:
+                    visible_segments.append(self._build_boundary_placeholder(visible_rules))
+                else:
+                    visible_segments.append(segment)
             else:
-                sanitized_segments.append(segment)
+                sanitized_memory_segments.append(segment)
+                visible_segments.append(segment)
 
-        if not result["boundary_violated"]:
+        if not result["boundary_relevant"]:
             return result
 
-        sanitized_text = " ".join(segment for segment in sanitized_segments if segment).strip() or text
-        result["memory_safe_text"] = sanitized_text
-        result["user_visible_text"] = sanitized_text if repair_user_visible else text
+        memory_safe_text = " ".join(segment for segment in sanitized_memory_segments if segment).strip() or text
+        visible_text = " ".join(segment for segment in visible_segments if segment).strip() or text
+        result["memory_safe_text"] = memory_safe_text
+        result["user_visible_text"] = visible_text if repair_user_visible else text
         result["matched_rules"] = list(matched_rule_map.values())
+        result["visible_rules"] = list(visible_rule_map.values())
         return result
 
     def sanitize_assistant_memory(self, text: str, boundary_rules: Optional[List[Dict[str, Any]]] = None) -> tuple[str, bool]:
@@ -297,7 +352,7 @@ class FastPathMemoryWriter:
         return "경계 요청이 있었다. 특정 주제는 다시 꺼내지 않아야 한다."
 
     def _make_processed_barrier_key(self, user_id: str, timestamp: float,
-                                    barriers: List[Dict[str, str]]) -> str:
+                                    barriers: List[Dict[str, Any]]) -> str:
         payload = json.dumps(
             {
                 "user_id": user_id,
@@ -307,10 +362,11 @@ class FastPathMemoryWriter:
                         {
                             "kind": barrier["kind"],
                             "target": barrier["target"],
+                            "topic_label": barrier.get("topic_label") or "",
                         }
                         for barrier in barriers
                     ],
-                    key=lambda item: (item["kind"], item["target"]),
+                    key=lambda item: (item["kind"], item["target"], item["topic_label"]),
                 ),
             },
             ensure_ascii=False,
@@ -344,8 +400,10 @@ class FastPathMemoryWriter:
                 return label
         return "personal"
 
-    def _boundary_target_hash(self, text: str) -> str:
+    def _hash_boundary_term(self, text: str) -> str:
         normalized = self._normalize_boundary_text(text)
+        if not normalized:
+            return ""
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
     def _normalize_boundary_text(self, text: str) -> str:
@@ -375,8 +433,11 @@ class FastPathMemoryWriter:
             "kind": claim.value.get("kind") or claim.value.get("policy_kind") or "avoid_topic",
             "topic_label": claim.qualifiers.get("topic_label") or "personal",
             "target": claim.value.get("target") or "",
+            "target_entity_id": claim.value.get("target_entity_id") or "",
             "sensitive_tokens": list(claim.qualifiers.get("sensitive_tokens") or []),
             "semantic_terms": list(claim.qualifiers.get("semantic_terms") or []),
+            "target_alias_hashes": list(claim.qualifiers.get("target_alias_hashes") or []),
+            "target_roles": list(claim.qualifiers.get("target_roles") or []),
         }
         return self._to_runtime_boundary_rule(barrier)
 
@@ -385,12 +446,25 @@ class FastPathMemoryWriter:
         semantic_terms = list(dict.fromkeys(
             list(barrier.get("semantic_terms") or []) + self._topic_semantic_terms(topic_label)
         ))
+        target_entity_id = str(barrier.get("target_entity_id") or "")
+        target_aliases = list(dict.fromkeys(
+            list(barrier.get("target_aliases") or []) + self._target_aliases_for_entity(target_entity_id)
+        ))
+        target_alias_hashes = list(dict.fromkeys(
+            list(barrier.get("target_alias_hashes") or []) +
+            [self._hash_boundary_term(alias) for alias in target_aliases if alias]
+        ))
+        target_roles = list(dict.fromkeys(barrier.get("target_roles") or []))
         rule = {
             "kind": barrier["kind"],
             "topic_label": topic_label,
             "target": barrier.get("target") or "",
+            "target_entity_id": target_entity_id,
             "sensitive_tokens": list(dict.fromkeys(barrier.get("sensitive_tokens") or [])),
             "semantic_terms": semantic_terms,
+            "target_aliases": target_aliases,
+            "target_alias_hashes": target_alias_hashes,
+            "target_roles": target_roles,
         }
         rule["semantic_text"] = self._build_boundary_semantic_text(rule)
         return rule
@@ -413,6 +487,15 @@ class FastPathMemoryWriter:
             merged[key]["semantic_terms"] = list(dict.fromkeys(
                 merged[key].get("semantic_terms", []) + runtime_rule.get("semantic_terms", [])
             ))
+            merged[key]["target_aliases"] = list(dict.fromkeys(
+                merged[key].get("target_aliases", []) + runtime_rule.get("target_aliases", [])
+            ))
+            merged[key]["target_alias_hashes"] = list(dict.fromkeys(
+                merged[key].get("target_alias_hashes", []) + runtime_rule.get("target_alias_hashes", [])
+            ))
+            merged[key]["target_roles"] = list(dict.fromkeys(
+                merged[key].get("target_roles", []) + runtime_rule.get("target_roles", [])
+            ))
             merged[key]["semantic_text"] = self._build_boundary_semantic_text(merged[key])
         return list(merged.values())
 
@@ -425,14 +508,19 @@ class FastPathMemoryWriter:
             str(rule.get("topic_label") or ""),
             " ".join(rule.get("semantic_terms") or []),
             " ".join(rule.get("sensitive_tokens") or []),
+            " ".join((rule.get("target_aliases") or [])[:3]),
+            " ".join((rule.get("target_roles") or [])[:3]),
         ]
         return " ".join(part for part in parts if part).strip()
 
     def _match_boundary_rules(self, text: str, boundary_rules: List[Dict[str, Any]],
-                              segment_embeddings: Optional[Dict[str, List[float]]] = None) -> List[Dict[str, Any]]:
+                              segment_embeddings: Optional[Dict[str, List[float]]] = None,
+                              target_scope_confirmed: bool = False) -> List[Dict[str, Any]]:
         normalized = self._normalize_boundary_text(text)
         matched: List[Dict[str, Any]] = []
         for rule in boundary_rules:
+            if not target_scope_confirmed and not self._match_rule_target_scope(normalized, rule):
+                continue
             tokens = [self._normalize_boundary_text(token) for token in (rule.get("sensitive_tokens") or []) if token]
             if tokens and any(token in normalized for token in tokens):
                 matched.append(rule)
@@ -448,6 +536,200 @@ class FastPathMemoryWriter:
             if self._semantic_boundary_match(normalized, rule, segment_embeddings):
                 matched.append(rule)
         return matched
+
+    def summarize_boundary_rules(self, boundary_rules: Optional[List[Dict[str, Any]]] = None,
+                                 limit: int = 6) -> List[str]:
+        summaries: List[str] = []
+        for rule in self._dedupe_boundary_rules(boundary_rules or [])[:max(limit, 0)]:
+            target_desc = self._boundary_target_description(rule)
+            topic_desc = str(rule.get("topic_label") or "personal")
+            if str(rule.get("kind") or "") == "avoid_topic":
+                summaries.append(f"avoid_topic: {target_desc or topic_desc}는 다시 꺼내거나 상세 재언급하지 말 것")
+            else:
+                summaries.append(
+                    f"do_not_store_sensitive: {target_desc or topic_desc}는 민감 세부를 반복하지 말고 필요하면 고수준으로만 답할 것"
+                )
+        return summaries
+
+    def _resolve_boundary_target(self, subject_id: str, text: str) -> Dict[str, Any]:
+        normalized = self._normalize_boundary_text(text)
+        target_surface = self._extract_target_surface(normalized)
+        inventory = self._build_boundary_target_inventory(subject_id)
+
+        match_source = target_surface or normalized
+        matched_entity_ids = QueryPlanner._match_entities_by_name(match_source, inventory)
+        target_entity_id = matched_entity_ids[0] if matched_entity_ids else ""
+
+        requested_roles = QueryPlanner._detect_requested_roles(match_source)
+        if not target_entity_id and requested_roles:
+            role_match = QueryPlanner._resolve_by_role_aliases(subject_id, requested_roles, inventory)
+            if role_match:
+                target_entity_id = str(role_match.get("entity_id") or "")
+
+        target_entry = inventory.get(target_entity_id, {})
+        target_aliases = list(target_entry.get("names", []))
+        target_roles = list(target_entry.get("roles", []))
+        if requested_roles:
+            target_roles.extend(requested_roles)
+            target_roles = list(dict.fromkeys(target_roles))
+
+        should_scope = bool(
+            target_entity_id
+            or requested_roles
+            or (target_surface and self._looks_like_specific_target(target_surface))
+        )
+        fingerprint_source = target_surface or (target_aliases[0] if target_aliases else "")
+        alias_hashes = []
+        if should_scope:
+            alias_hashes = [
+                self._hash_boundary_term(alias)
+                for alias in list(dict.fromkeys(target_aliases + ([target_surface] if target_surface else [])))
+                if alias
+            ]
+        return {
+            "fingerprint": self._hash_boundary_term(fingerprint_source) if should_scope else "",
+            "entity_id": target_entity_id,
+            "aliases": target_aliases,
+            "alias_hashes": list(dict.fromkeys(hash_value for hash_value in alias_hashes if hash_value)),
+            "roles": target_roles,
+        }
+
+    def _extract_target_surface(self, normalized_text: str) -> str:
+        stripped = re.sub(
+            r"(저장하지 마|기억하지 마|다시 꺼내지 마|그 얘기 꺼내지 마)",
+            " ",
+            normalized_text,
+        )
+        stripped = re.sub(r"(얘기|이야기|내용|주제|부분|건|거)(?:는|은|이|가|를|을|도|만)?", " ", stripped)
+        stripped = re.sub(r"\s+", " ", stripped).strip()
+        if not stripped:
+            return ""
+        first = re.split(r"\b(?:그리고|근데|하지만|다만|또)\b", stripped)[0]
+        first = re.sub(r"\b(?:내|저|나)\b", " ", first)
+        tokens: List[str] = []
+        for token in re.findall(r"[a-z0-9가-힣_]+", first):
+            token = re.sub(r"(은|는|이|가|을|를|에|도|만|과|와|의|로|으로)$", "", token).strip()
+            if not token or token in {"얘기", "이야기", "내용", "주제", "부분", "건", "거"}:
+                continue
+            tokens.append(token)
+        return " ".join(tokens[:4]).strip()
+
+    def _looks_like_specific_target(self, target_surface: str) -> bool:
+        normalized = self._normalize_boundary_text(target_surface)
+        if not normalized or normalized in {"사람", "얘기", "이야기", "내용", "주제"}:
+            return False
+        topic_terms = {
+            self._normalize_boundary_text(term)
+            for terms in self.BOUNDARY_TOPIC_TERMS.values()
+            for term in terms
+        }
+        return normalized not in topic_terms
+
+    def _build_boundary_target_inventory(self, subject_id: str) -> Dict[str, Dict[str, Any]]:
+        inventory: Dict[str, Dict[str, Any]] = {}
+        for node in self.graph.get_all_nodes():
+            user_id = str(getattr(node, "user_id", "") or "")
+            if not user_id:
+                continue
+            entry = inventory.setdefault(
+                user_id,
+                {"entity_id": user_id, "names": [], "roles": [], "last_seen": 0.0},
+            )
+            nickname = str(getattr(node, "nickname", "") or "").strip()
+            if nickname:
+                entry["names"].append(nickname)
+            for historical in getattr(node, "nickname_history", []) or []:
+                historical_name = str(historical or "").strip()
+                if historical_name:
+                    entry["names"].append(historical_name)
+
+        if self.store and subject_id:
+            relation_claims = self.store.get_active_claims(
+                subject_id=subject_id,
+                facets=[Facet.RELATION_TO_ENTITY.value],
+                viewer_id=subject_id,
+                limit=200,
+            )
+            for claim in relation_claims:
+                target_entity_id = str(claim.value.get("target_entity_id") or "")
+                if not target_entity_id:
+                    continue
+                entry = inventory.setdefault(
+                    target_entity_id,
+                    {"entity_id": target_entity_id, "names": [], "roles": [], "last_seen": 0.0},
+                )
+                relation_kind = claim.value.get("relation_kind")
+                if relation_kind:
+                    entry["roles"].extend(QueryPlanner.expand_role_aliases(relation_kind))
+
+        for entry in inventory.values():
+            entry["names"] = list(dict.fromkeys(name for name in entry["names"] if name))
+            entry["roles"] = list(dict.fromkeys(role for role in entry["roles"] if role))
+        return inventory
+
+    def _target_aliases_for_entity(self, entity_id: str) -> List[str]:
+        if not entity_id:
+            return []
+        return list(self._build_boundary_target_inventory("").get(entity_id, {}).get("names", []))
+
+    def _boundary_target_description(self, rule: Dict[str, Any]) -> str:
+        aliases = [alias for alias in (rule.get("target_aliases") or []) if alias]
+        if aliases:
+            return aliases[0]
+        roles = [role for role in (rule.get("target_roles") or []) if role and role != "person"]
+        if roles:
+            return roles[0]
+        return ""
+
+    def _match_rule_target_scope(self, normalized_text: str, rule: Dict[str, Any]) -> bool:
+        if not self._rule_has_target_scope(rule):
+            return True
+
+        aliases = [
+            self._normalize_boundary_text(alias)
+            for alias in (rule.get("target_aliases") or [])
+            if alias
+        ]
+        if aliases and any(alias and alias in normalized_text for alias in aliases):
+            return True
+
+        roles = [
+            self._normalize_boundary_text(role)
+            for role in (rule.get("target_roles") or [])
+            if role and role != "person"
+        ]
+        if roles and any(role and role in normalized_text for role in roles):
+            return True
+
+        candidate_hashes = self._candidate_boundary_phrase_hashes(normalized_text)
+        target_hashes = {str(rule.get("target") or "")}
+        target_hashes.update(
+            str(alias_hash)
+            for alias_hash in (rule.get("target_alias_hashes") or [])
+            if alias_hash
+        )
+        target_hashes.discard("")
+        return bool(target_hashes.intersection(candidate_hashes))
+
+    def _rule_has_target_scope(self, rule: Dict[str, Any]) -> bool:
+        return bool(
+            rule.get("target_entity_id")
+            or rule.get("target")
+            or rule.get("target_aliases")
+            or rule.get("target_alias_hashes")
+            or rule.get("target_roles")
+        )
+
+    def _candidate_boundary_phrase_hashes(self, normalized_text: str) -> set[str]:
+        tokens = [token for token in re.findall(r"[a-z0-9가-힣_]+", normalized_text) if token]
+        hashes: set[str] = set()
+        max_ngram = min(len(tokens), 4)
+        for size in range(1, max_ngram + 1):
+            for index in range(0, len(tokens) - size + 1):
+                hash_value = self._hash_boundary_term(" ".join(tokens[index:index + size]))
+                if hash_value:
+                    hashes.add(hash_value)
+        return hashes
 
     def _semantic_boundary_match(self, normalized_text: str, rule: Dict[str, Any],
                                  segment_embeddings: Optional[Dict[str, List[float]]] = None) -> bool:
