@@ -33,6 +33,8 @@ after work:
 엔트리포인트 설정해야함.
 '''
 
+_WRAPPED_DOUBLE_QUOTES_RE = re.compile(r'^\s*"(?P<content>[\s\S]*?)"\s*$')
+
 class BotOrchestrator:
     """
     [The Ego: Central Controller]
@@ -242,6 +244,7 @@ class BotOrchestrator:
             boundary_rules=boundary_rules,
             relevant_boundary_rules=relevant_boundary_rules,
         )
+        response_text = self._strip_wrapping_double_quotes(response_text)
         boundary_enforcement = self.fast_path_writer.enforce_assistant_boundaries(
             response_text,
             boundary_rules=relevant_boundary_rules or boundary_rules,
@@ -254,8 +257,8 @@ class BotOrchestrator:
         ) or bool(boundary_enforcement.get("user_visible_boundary_relevant"))
         boundary_violated = bool(boundary_enforcement["boundary_violated"])
         boundary_respected = bool(boundary_checked and avoid_topic_relevant and not boundary_violated)
-        memory_safe_response = boundary_enforcement["memory_safe_text"]
-        visible_response_text = boundary_enforcement["user_visible_text"]
+        memory_safe_response = self._strip_wrapping_double_quotes(boundary_enforcement["memory_safe_text"])
+        visible_response_text = self._strip_wrapping_double_quotes(boundary_enforcement["user_visible_text"])
         
         # 2. Feedback Loop
         # (A) 현재 사용자 세션 기분 업데이트
@@ -495,3 +498,13 @@ class BotOrchestrator:
             return text, emotion
         else:
             return full_response, bot_mood # 태그 없으면 기존 기분 유지
+
+    def _strip_wrapping_double_quotes(self, text: str) -> str:
+        if not text:
+            return text
+
+        # Some model outputs wrap the entire reply in a single pair of quotes.
+        match = _WRAPPED_DOUBLE_QUOTES_RE.fullmatch(text)
+        if not match:
+            return text
+        return match.group("content")

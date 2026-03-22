@@ -1,4 +1,4 @@
-# 🧠 CogBot: Human-like Cognitive AI Agent (v4)
+# 🧠 CogBot: Human-like Cognitive AI Agent (v5)
 
 > **"기억하고, 느끼고, 관계를 맺으며 성장하는 AI"**
 > CogBot은 단순한 RAG(검색 증강 생성)를 넘어, **인지 심리학(Cognitive Psychology)** 이론과 **사회적 지능(Social Intelligence)**을 공학적으로 구현한 차세대 챗봇 프레임워크입니다.

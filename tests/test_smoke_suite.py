@@ -50,6 +50,12 @@ def test_model_eval_gate_matches_pinned_config():
     assert client is not None
 
 
+def test_model_eval_gate_resolves_relative_to_config_module(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    client = UnifiedAPIClient(enable_logging=False, exclude_embedding_log=True)
+    assert client is not None
+
+
 def test_boundary_payload_is_encrypted_and_runtime_behavior_is_split(smoke_orchestrator, temp_canonical_db):
     bot = smoke_orchestrator
 
@@ -147,6 +153,26 @@ def test_boundary_payload_is_not_plaintext_in_graph_snapshot_or_delta(
     assert row[2] is not None
     assert "병력" not in row[0]
     assert "병력" not in row[1]
+
+
+def test_wrapped_double_quotes_are_removed_from_final_response(smoke_orchestrator):
+    bot = smoke_orchestrator
+
+    quoted_msg = {
+        "user_id": "user_001",
+        "user_name": "테스터",
+        "msg": "답변 따옴표 버그를 재현해봐",
+        "role": "user",
+        "timestamp": time.time(),
+    }
+    bot._run_slow_generation = lambda *args, **kwargs: ('"이제 따옴표 없이 보일 거야."', "차분함")
+
+    response = bot.process_trigger([], quoted_msg)
+
+    assert response == "이제 따옴표 없이 보일 거야."
+    assistant_memories = [m.content for m in bot.stm.memory_queue if m.role == "assistant"]
+    assert assistant_memories[-1] == "이제 따옴표 없이 보일 거야."
+    assert bot._strip_wrapping_double_quotes('그는 "안녕"이라고 말했다.') == '그는 "안녕"이라고 말했다.'
 
 
 def test_legacy_boundary_persistence_is_scrubbed_on_startup(temp_graph_files):

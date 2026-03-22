@@ -185,13 +185,31 @@ class UnifiedAPIClient:
             return value.strip()
         return default
 
+    def _resolve_project_relative_path(self, path_value: str) -> str:
+        expanded = os.path.expanduser(path_value)
+        if os.path.isabs(expanded):
+            return expanded
+
+        cwd_candidate = os.path.abspath(expanded)
+        if os.path.exists(cwd_candidate):
+            return cwd_candidate
+
+        config_file = getattr(config, "__file__", "")
+        if isinstance(config_file, str) and config_file.strip():
+            config_dir = os.path.dirname(os.path.abspath(config_file))
+            config_relative = os.path.abspath(os.path.join(config_dir, expanded))
+            if os.path.exists(config_relative):
+                return config_relative
+
+        return cwd_candidate
+
     def _validate_model_eval_gate(self):
         if not self._config_bool("MODEL_EVAL_GATE_ENABLED", False):
             return
 
-        gate_path = os.path.abspath(os.path.expanduser(
+        gate_path = self._resolve_project_relative_path(
             self._config_str("MODEL_EVAL_GATE_PATH", "model_eval_gate.json")
-        ))
+        )
         enforce = self._config_bool("MODEL_EVAL_GATE_ENFORCE", True)
         if not os.path.exists(gate_path):
             message = f"Model eval gate file is missing: {gate_path}"
