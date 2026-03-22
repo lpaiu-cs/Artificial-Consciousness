@@ -149,6 +149,111 @@ def test_boundary_payload_is_not_plaintext_in_graph_snapshot_or_delta(
     assert "병력" not in row[1]
 
 
+def test_legacy_boundary_persistence_is_scrubbed_on_startup(temp_graph_files):
+    graph_path = Path(temp_graph_files["graph_path"])
+    delta_path = Path(str(graph_path).replace(".json", "_delta.jsonl"))
+    leaked_snapshot_claim = {
+        "node_id": "legacy-boundary-snapshot",
+        "subject_id": "user_001",
+        "facet": "boundary.rule",
+        "merge_key": "user_001|boundary.rule|kind=do_not_store_sensitive|target=health-fingerprint",
+        "value": {
+            "kind": "do_not_store_sensitive",
+            "policy_kind": "do_not_store_sensitive",
+            "target": "health-fingerprint",
+            "target_entity_id": "user_001",
+        },
+        "qualifiers": {
+            "topic_label": "health",
+            "sensitive_tokens": ["병력"],
+            "semantic_terms": ["병력", "진료", "의료"],
+            "target_aliases": ["본인"],
+            "target_alias_hashes": ["abc123"],
+            "target_roles": ["self"],
+        },
+        "nl_summary": "health 관련 민감 주제를 저장하지 말라는 경계 요청이 있음",
+        "source_type": "explicit",
+        "confidence": 0.98,
+        "status": "active",
+        "valid_from": None,
+        "valid_to": None,
+        "last_confirmed_at": time.time(),
+        "evidence_episode_ids": [],
+        "sensitivity": "high",
+        "scope": "user_private",
+        "type": "claim",
+        "edges": {},
+    }
+    leaked_delta_claim = {
+        **leaked_snapshot_claim,
+        "node_id": "legacy-boundary-delta",
+        "merge_key": "user_001|boundary.rule|kind=avoid_topic|target=health-fingerprint",
+        "value": {
+            "kind": "avoid_topic",
+            "policy_kind": "avoid_topic",
+            "target": "health-fingerprint",
+            "target_entity_id": "user_001",
+        },
+    }
+
+    snapshot_payload = {
+        "episodes": {},
+        "insights": {},
+        "notes": {},
+        "claims": {leaked_snapshot_claim["node_id"]: leaked_snapshot_claim},
+        "entities": {},
+    }
+    graph_path.write_text(
+        json.dumps(snapshot_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    delta_entry = {
+        "timestamp": time.time(),
+        "action": "UPSERT_NODE",
+        "payload": {
+            "category": "claims",
+            "data": leaked_delta_claim,
+        },
+    }
+    delta_path.write_text(
+        json.dumps(delta_entry, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    migrated_graph = MemoryGraph(
+        graph_path=temp_graph_files["graph_path"],
+        embeddings_path=temp_graph_files["embeddings_path"],
+    )
+
+    snapshot_text = graph_path.read_text(encoding="utf-8")
+    delta_text = delta_path.read_text(encoding="utf-8")
+    combined = snapshot_text + delta_text
+    assert delta_text.strip() == ""
+    assert "병력" not in combined
+    for marker in [
+        "sensitive_tokens",
+        "semantic_terms",
+        "target_roles",
+        "target_alias_hashes",
+        "target_aliases",
+        "target_entity_id",
+    ]:
+        assert marker not in combined
+
+    snapshot_claim = migrated_graph.claims["legacy-boundary-snapshot"]
+    delta_claim = migrated_graph.claims["legacy-boundary-delta"]
+    assert snapshot_claim.qualifiers == {"topic_label": "health"}
+    assert delta_claim.qualifiers == {"topic_label": "health"}
+    assert snapshot_claim.value == {
+        "kind": "do_not_store_sensitive",
+        "policy_kind": "do_not_store_sensitive",
+    }
+    assert delta_claim.value == {
+        "kind": "avoid_topic",
+        "policy_kind": "avoid_topic",
+    }
+
+
 def test_boundary_payload_supports_keyring_decode_and_rotation(temp_canonical_db, canonical_keyring):
     key_a = Fernet.generate_key().decode("utf-8")
     key_b = Fernet.generate_key().decode("utf-8")

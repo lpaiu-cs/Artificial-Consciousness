@@ -188,7 +188,7 @@ python run_tests.py --smoke
 ```
 
 * `tests/test_smoke_suite.py`는 공개 저장소에 포함된 최소 재현 스위트입니다.
-* smoke suite는 pinned model gate, boundary payload 암호화, graph/delta plaintext leak 방지, keyring decode/rotation, boundary enforcement 분기, semantic fallback budget/caching을 확인합니다.
+* smoke suite는 pinned model gate, boundary payload 암호화, graph/delta plaintext leak 방지, legacy snapshot/delta startup scrub migration, keyring decode/rotation, boundary enforcement 분기, semantic fallback budget/caching을 확인합니다.
 * `model_eval_gate.json`은 현재 허용된 모델 스냅샷을 선언하며, 실행 시 설정된 모델이 gate와 어긋나면 초기화 단계에서 차단할 수 있습니다.
 
 ---
@@ -241,7 +241,7 @@ reflection은 eviction된 STM 기억을 자유문장 insight로만 저장하지 
 1. `model_eval_gate.json`은 embedding / smart / fast 모델의 승인 스냅샷을 선언합니다.
 2. `UnifiedAPIClient`는 시작 시 gate를 읽고, 승인되지 않은 모델 구성이면 경고 또는 실패로 차단합니다.
 3. `run_tests.py --smoke`는 공개 저장소에 포함된 최소 smoke suite만 실행해 외부에서도 핵심 경로를 재현할 수 있게 합니다.
-4. smoke suite는 boundary payload가 canonical encrypted blob 외 저장물에 평문으로 남지 않는지, keyring rotation 후 `payload_key_id`가 실제 복호화 selector로 동작하는지까지 확인합니다.
+4. smoke suite는 boundary payload가 canonical encrypted blob 외 저장물에 평문으로 남지 않는지, 이미 유출된 legacy snapshot/delta가 startup 시 scrub되는지, keyring rotation 후 `payload_key_id`가 실제 복호화 selector로 동작하는지까지 확인합니다.
 5. boundary semantic fallback은 lexical/target match 이후에만 제한적으로 실행되며, rule embedding cache + segment/result cache로 반복 비용을 억제합니다.
 
 ### 6. CogBot Architecture Diagram
