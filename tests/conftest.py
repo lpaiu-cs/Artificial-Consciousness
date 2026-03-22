@@ -63,7 +63,7 @@ class MockUnifiedAPIClient:
         """Mock fast LLM response (System 1 - Groq)"""
         return f"[MOCK_FAST] Processed: {user_prompt[:50]}..."
     
-    def chat_slow(self, system_prompt: str, user_prompt: str, json_mode: bool = False):
+    def chat_slow(self, system_prompt: str, user_prompt: str, json_mode: bool = False, json_schema=None):
         """Mock slow LLM response (System 2 - GPT-4)"""
         if json_mode:
             return {

@@ -1,12 +1,7 @@
-import sys
-import os
 import time
 
-# 모듈 경로 잡기
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-from bot_orchestrator import BotOrchestrator
-from memory_structures import EpisodeNode
+from cogbot.bot_orchestrator import BotOrchestrator
+from cogbot.memory_structures import EpisodeNode
 
 # =========================================================
 # 1. 디버깅용 가짜 API 클라이언트 (Interceptor)

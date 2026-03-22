@@ -1,1 +1,1 @@
-"""Memory package for ontology and future storage modules."""
+from cogbot.memory import *  # noqa: F401,F403

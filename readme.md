@@ -95,23 +95,27 @@ CogBot은 인간의 뇌와 사회적 상호작용 방식을 모방하여 설계�
 
 ```bash
 CogBot/
-├── main.py                 # 🚀 실행 엔트리 포인트
-├── config.py               # ⚙️ 설정 (API Key, Positive Anchor, Thresholds)
-├── api_client.py           # 🌐 통합 API 클라이언트 (OpenAI, Groq)
-├── memory_structures.py    # 📦 데이터 클래스 (Claim/Note/Episode/Entity 정의)
-├── memory/
+├── pyproject.toml          # 📦 패키지 메타데이터
+├── cogbot/
 │   ├── __init__.py
-│   └── ontology.py         # facet spec, merge policy, sensitivity 정의
-├── bot_orchestrator.py     # 🧠 중앙 제어 장치 (The Ego & Logic)
-│
-└── modules/                # 🧩 기능별 모듈
-    ├── sensory_system.py   # 감각: delta ingest, 청킹, 임베딩, 화자 식별
-    ├── stm_handler.py      # STM: 벡터 유사도 기반 주의 집중(Attention)
-    ├── ltm_graph.py        # LTM: Claim/Note/Episode/Entity 그래프 저장소
-    ├── ltm_handler.py      # LTM: claim-aware 그래프 탐색 및 접근 제어
-    ├── reflection_handler.py # 성찰: structured claims/notes 생성 및 엣지 연결
-    └── social_module.py    # 사회성: 정체성 관리 및 affinity 업데이트
-
+│   ├── config.py           # ⚙️ 설정 (API Key, Positive Anchor, Thresholds)
+│   ├── api_client.py       # 🌐 통합 API 클라이언트 (OpenAI, Groq)
+│   ├── memory_structures.py # 📦 데이터 클래스
+│   ├── bot_orchestrator.py # 🧠 중앙 제어 장치 (The Ego & Logic)
+│   ├── memory/
+│   │   ├── __init__.py
+│   │   └── ontology.py     # facet spec, merge policy, sensitivity 정의
+│   └── modules/            # 🧩 기능별 모듈
+│       ├── sensory_system.py
+│       ├── stm_handler.py
+│       ├── ltm_graph.py
+│       ├── ltm_handler.py
+│       ├── reflection_handler.py
+│       └── social_module.py
+├── api_client.py           # backward-compatible shim
+├── bot_orchestrator.py     # backward-compatible shim
+├── memory/                 # backward-compatible shims
+└── modules/                # backward-compatible shims
 ```
 
 ---
@@ -165,7 +169,7 @@ LTM_GRAPH_PATH = "ltm_graph.json" # Snapshot
 ### 4. 실행
 
 ```python
-from bot_orchestrator import BotOrchestrator
+from cogbot.bot_orchestrator import BotOrchestrator
 
 bot = BotOrchestrator()
 
@@ -247,81 +251,128 @@ reflection은 eviction된 STM 기억을 자유문장 insight로만 저장하지 
 ### 6. CogBot Architecture Diagram
 
 ```mermaid
+%%{init: {
+  "theme": "base",
+  "flowchart": { "curve": "basis" },
+  "themeVariables": {
+    "fontFamily": "Inter, Pretendard, Arial",
+    "primaryTextColor": "#111827",
+    "lineColor": "#374151",
+    "fontSize": "16px"
+  }
+}}%%
 graph TD
-    %% --- Styling ---
-    classDef ego fill:#f9f,stroke:#333,stroke-width:2px,color:#000;
-    classDef memory fill:#dfd,stroke:#333,stroke-width:1px,color:#000;
-    classDef process fill:#bbf,stroke:#333,stroke-width:1px,color:#000;
-    classDef external fill:#eee,stroke:#333,stroke-width:1px,stroke-dasharray: 5 5,color:#000;
-    classDef database fill:#ffd,stroke:#333,stroke-width:2px,color:#000;
 
-    %% --- External Entities ---
-    User([👤 User Input]):::external
-    API_Groq{{⚡ Groq API<br/>System 1: Fast}}:::external
-    API_OpenAI{{🧠 OpenAI API<br/>System 2: Slow & Embedding}}:::external
+    %% ---------- Top Row ----------
+    subgraph TOP[" "]
+        direction LR
+        PADL[" "]:::blank
+        U["👤 User Input"]:::user
+        API_FAST["Fast Model API<br/>(⚡ Groq · System 1)"]:::api
+        API_SLOW["Slow Model API<br/>(🧠 OpenAI · System 2)"]:::api
+    end
 
-    %% --- Main System ---
-    subgraph "🤖 CogBot (The Ego)"
-        BO["Bot Orchestrator<br/>Central Controller"]:::ego
-        
-        subgraph "Perception & Identity"
-            Sensory["Sensory System<br/>Delta Ingest, Chunking & Embedding"]:::process
-            SocialManager["Social Manager<br/>Identity & Vector Logic"]:::process
+    %% ---------- Middle Row ----------
+    subgraph MID[" "]
+        direction LR
+
+        subgraph PER["1. PERCEIVE (인지 단계)"]
+            direction LR
+            BR["Boundary Redaction<br/>(Clause-level, target-aware)"]:::perceive
+            SS["Sensory System<br/>(Delta ingest, durable cursor,<br/>chunking & embedding)"]:::perceive
+            ID["Identity & Fast Path<br/>(nickname mapping,<br/>FastPathMemoryWriter)"]:::perceive
         end
-        
-        subgraph "Memory Systems (Cognitive Core)"
-            STM["Working Memory (STM)<br/>Semantic Attention (Vector)"]:::memory
-            LTM_Handler["LTM Handler<br/>Claim-aware Graph Retrieval"]:::memory
-            LTM_Graph[("Memory Graph DB<br/>Entity-Claim-Note-Episode")]:::database
-        end
-        
-        subgraph "External Interface"
-            UnifiedAPI["Unified API Client"]:::process
+
+        BO["🤖 Bot Orchestrator<br/>(Main Loop Controller)"]:::orchestrator
+
+        subgraph RET["2. RETRIEVE (기억 인출 단계)"]
+            direction LR
+            STM["Working Memory (STM)<br/>(priority queue & semantic boost)"]:::retrieve
+            QP["QueryPlanner<br/>(referent cache & role alias)"]:::retrieve
+            LTM["LTM Handler<br/>(claim-aware search, ACL,<br/>context bundle)"]:::retrieve
         end
     end
 
-    %% --- Background Process ---
-    subgraph "Background Process (Async)"
-        Reflection["Reflection Handler<br/>Structured Claims/Notes & Log Persistence"]:::process
+    %% ---------- Bottom Row ----------
+    subgraph BOT[" "]
+        direction LR
+
+        subgraph ACT["4. ACT (행동 및 반영 단계)"]
+            direction LR
+            ENF["Boundary Enforcement<br/>(memory-safe text,<br/>user-visible repair)"]:::act
+            SM["SocialManager<br/>(event-based relation update,<br/>fulfillment-aware reliability)"]:::act
+            RH["Reflection Handler<br/>(claims[] / notes[] extraction,<br/>background consolidation)"]:::act
+        end
+
+        subgraph THINK["3. THINK (사고 및 생성 단계)"]
+            direction LR
+            GEN["Generation Stack<br/>(prompt reconstruction,<br/>model eval gate,<br/>fast/slow routing,<br/>structured output)"]:::think
+        end
+
+        subgraph MEM["Memory Layer"]
+            direction TB
+            CS[("Canonical State DB<br/>(SQLite)<br/>active claims, open loops,<br/>interaction policy, relation state,<br/>encrypted boundary payload)")]:::canonical
+            MG[("Memory Graph DB<br/>(Entity-Claim-Note-Episode)<br/>snapshot + delta,<br/>public boundary projection)")]:::memory
+        end
     end
 
-    %% --- Main Flow ---
-    User -->|"1. Trigger (ID/Nick)"| BO
+    %% ---------- Core Flow ----------
+    U -->|"① Trigger"| BO
 
-    %% 2. Perception
-    BO -->|"2. Raw Logs"| Sensory
-    Sensory -->|"Chunks"| BO
-    BO -->|"3. Identity Check"| SocialManager
-    BO -->|"4. Inject"| STM
+    BO -->|"② Process Input"| BR
+    BR --> SS
+    BR --> ID
 
-    %% 3. Retrieval Loop
-    BO -->|"5. Query Context"| LTM_Handler
-    LTM_Handler -->|"Get Embedding"| UnifiedAPI
-    LTM_Handler <-->|"6. Graph Search & Filter"| LTM_Graph
-    LTM_Handler -->|"7. Retrieved Nodes"| BO
-    
-    %% 4. Attention
-    BO -->|"8. Semantic Boost"| STM
+    SS -->|"Chunks / embeddings"| BO
+    ID -->|"Identity / fast-path state"| BO
 
-    %% 5. Cognition
-    BO -->|"Context Info"| SocialManager
-    
-    BO -->|"9. Fast Summary (ID Rendering)"| UnifiedAPI
-    UnifiedAPI -.-> API_Groq
-    
-    BO -->|"10. Generation (Ans + Feeling)"| UnifiedAPI
-    UnifiedAPI -.-> API_OpenAI
+    BO -->|"③ Inject & Query"| STM
+    BO -->|"③ Inject & Query"| QP
 
-    %% 6. Action & Social
-    BO -->|"11. Interaction Signal Update"| SocialManager
-    SocialManager -->|"Delta Log"| LTM_Graph
-    BO -->|"12. Final Response"| User
+    STM -->|"④ Semantic Boost"| LTM
+    QP -->|"⑤ Entity-aware Search"| LTM
+    CS -->|"State / ACL / boundary policy"| LTM
+    LTM <-->|"⑥ Search & Traverse"| MG
+    LTM -->|"⑦ Retrieved Context"| BO
 
-    %% --- Background Flows ---
-    STM -.->|"Evicted Memories"| Reflection
-    BO -.->|"Assistant Memory Queue"| Reflection
-    Reflection -->|"13. Create Episode/Claim/Note Edges"| LTM_Graph
-    LTM_Graph -.->|"Append Log"| LTM_Graph
+    CS -. "Active boundary policies" .-> GEN
+    BO -->|"⑧ Generate Request<br/>(Fast / Slow)"| GEN
+
+    GEN -. "System 1" .-> API_FAST
+    GEN -. "System 2" .-> API_SLOW
+    API_FAST -. "Fast inference" .-> GEN
+    API_SLOW -. "Slow reasoning / emotion" .-> GEN
+
+    GEN -->|"⑨ Generated Thought"| BO
+    BO -->|"⑩ Execute Action"| ENF
+    ENF -->|"⑪ Final Response"| U
+
+    %% ---------- Memory / Reflection ----------
+    ENF -->|"Memory-safe text"| STM
+    ENF -->|"Memory-safe text"| RH
+    STM -. "Evicted memories" .-> RH
+
+    RH -->|"⑫ Canonicalize"| CS
+    RH -->|"⑫ Persist / Wire"| MG
+
+    %% ---------- Social Loop ----------
+    U -->|"User tone / event signals"| SM
+    ENF -->|"Boundary / repair / fulfillment events"| SM
+    CS -->|"Open-loop lifecycle<br/>relation state"| SM
+    SM -->|"⑬ Relation Update"| CS
+    SM -->|"⑬ Social Trace"| MG
+
+    %% ---------- Styling ----------
+    classDef orchestrator fill:#09090B,stroke:#FFFFFF,stroke-width:3px,color:#FFFFFF;
+    classDef perceive fill:#EFF6FF,stroke:#60A5FA,stroke-width:2px,color:#111827;
+    classDef retrieve fill:#FFF7ED,stroke:#FB923C,stroke-width:2px,color:#111827;
+    classDef think fill:#FAF5FF,stroke:#C084FC,stroke-width:2px,color:#111827;
+    classDef act fill:#ECFDF5,stroke:#34D399,stroke-width:2px,color:#111827;
+    classDef memory fill:#FEF3C7,stroke:#F59E0B,stroke-width:2px,color:#111827;
+    classDef canonical fill:#DCFCE7,stroke:#22C55E,stroke-width:2px,color:#111827;
+    classDef api fill:#F3F4F6,stroke:#9CA3AF,stroke-width:1.5px,color:#111827;
+    classDef user fill:#FFFFFF,stroke:#D1D5DB,stroke-width:1.5px,color:#111827;
+    classDef blank fill:transparent,stroke:transparent,color:transparent;
 
 ```
 
