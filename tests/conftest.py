@@ -13,7 +13,7 @@ import pytest
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import config
+from cogbot import config
 from cryptography.fernet import Fernet
 
 
@@ -211,7 +211,7 @@ def sample_calling_message():
 @pytest.fixture
 def sample_memory_objects():
     """Provides sample MemoryObject instances for testing"""
-    from memory_structures import MemoryObject
+    from cogbot.memory_structures import MemoryObject
     import time
     
     return [

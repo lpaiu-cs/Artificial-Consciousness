@@ -6,13 +6,13 @@ from pathlib import Path
 import pytest
 from cryptography.fernet import Fernet
 
-import config
-from api_client import APILogger, UnifiedAPIClient
-from bot_orchestrator import BotOrchestrator
-from memory.canonical_store import CanonicalMemoryStore
-from memory.fast_path import FastPathMemoryWriter
-from memory_structures import ClaimNode
-from modules.ltm_graph import MemoryGraph
+from cogbot import config
+from cogbot.api_client import APILogger, UnifiedAPIClient
+from cogbot.bot_orchestrator import BotOrchestrator
+from cogbot.memory.canonical_store import CanonicalMemoryStore
+from cogbot.memory.fast_path import FastPathMemoryWriter
+from cogbot.memory_structures import ClaimNode
+from cogbot.modules.ltm_graph import MemoryGraph
 from tests.conftest import MockUnifiedAPIClient
 
 
@@ -54,6 +54,21 @@ def test_model_eval_gate_resolves_relative_to_config_module(monkeypatch, tmp_pat
     monkeypatch.chdir(tmp_path)
     client = UnifiedAPIClient(enable_logging=False, exclude_embedding_log=True)
     assert client is not None
+
+
+def test_legacy_wrapper_modules_are_removed():
+    repo_root = Path(__file__).resolve().parents[1]
+    legacy_paths = [
+        "api_client.py",
+        "bot_orchestrator.py",
+        "config.py",
+        "memory_structures.py",
+        "memory",
+        "modules",
+    ]
+
+    for relative_path in legacy_paths:
+        assert not (repo_root / relative_path).exists()
 
 
 def test_api_logger_writes_paired_chat_call(monkeypatch, tmp_path):

@@ -1,9 +1,14 @@
 import argparse
-from typing import List
+import sys
+from pathlib import Path
 
-import config
-from memory.canonical_store import CanonicalMemoryStore
-from modules.ltm_graph import MemoryGraph
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from cogbot import config
+from cogbot.memory.canonical_store import CanonicalMemoryStore
+from cogbot.modules.ltm_graph import MemoryGraph
 
 
 def backfill_legacy_insights(graph_path: str, embeddings_path: str, db_path: str) -> int:
