@@ -7,7 +7,7 @@ import pytest
 from cryptography.fernet import Fernet
 
 import config
-from api_client import UnifiedAPIClient
+from api_client import APILogger, UnifiedAPIClient
 from bot_orchestrator import BotOrchestrator
 from memory.canonical_store import CanonicalMemoryStore
 from memory.fast_path import FastPathMemoryWriter
@@ -54,6 +54,69 @@ def test_model_eval_gate_resolves_relative_to_config_module(monkeypatch, tmp_pat
     monkeypatch.chdir(tmp_path)
     client = UnifiedAPIClient(enable_logging=False, exclude_embedding_log=True)
     assert client is not None
+
+
+def test_api_logger_writes_paired_chat_call(monkeypatch, tmp_path):
+    log_file = tmp_path / "api_calls.jsonl"
+    monkeypatch.setattr(config, "API_LOGGING_ENABLED", True)
+    monkeypatch.setattr(config, "API_LOG_FILE", str(log_file))
+    monkeypatch.setattr(config, "API_LOG_LEVEL", "DEBUG")
+    monkeypatch.setattr(config, "API_LOG_INCLUDE_PAIR", True)
+    monkeypatch.setattr(config, "API_LOG_INCLUDE_CONTENT", True)
+    monkeypatch.setattr(config, "API_LOG_INCLUDE_PARSED_RESPONSE", True)
+    monkeypatch.setattr(config, "API_LOG_MAX_CONTENT_LENGTH", 2000)
+    monkeypatch.setattr(config, "API_LOG_EXCLUDE_EMBEDDING", True)
+
+    logger = APILogger()
+    call_id = logger.log_chat_request(
+        "OpenAI",
+        "gpt-test",
+        "system ontology prompt",
+        "user message",
+        json_mode=True,
+        response_format="json_schema",
+        operation="chat_slow",
+        json_schema={"name": "ontology_response", "schema": {"type": "object"}},
+    )
+    logger.log_chat_response(
+        "OpenAI",
+        "gpt-test",
+        '{"claims": [{"facet": "preference"}]}',
+        12.34,
+        success=True,
+        token_usage={"total_tokens": 42},
+        call_id=call_id,
+        operation="chat_slow",
+        json_mode=True,
+        response_format="json_schema",
+        parsed_response={"claims": [{"facet": "preference"}]},
+    )
+    logger.log_chat_pair(
+        "OpenAI",
+        "gpt-test",
+        "system ontology prompt",
+        "user message",
+        '{"claims": [{"facet": "preference"}]}',
+        12.34,
+        success=True,
+        token_usage={"total_tokens": 42},
+        call_id=call_id,
+        operation="chat_slow",
+        json_mode=True,
+        response_format="json_schema",
+        parsed_response={"claims": [{"facet": "preference"}]},
+        json_schema={"name": "ontology_response", "schema": {"type": "object"}},
+    )
+
+    entries = [json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines()]
+    assert [entry["type"] for entry in entries] == ["CHAT_REQUEST", "CHAT_RESPONSE", "CHAT_CALL"]
+    assert len({entry["call_id"] for entry in entries}) == 1
+
+    pair = entries[-1]
+    assert pair["schema_name"] == "ontology_response"
+    assert pair["request"]["system_prompt"]["preview"] == "system ontology prompt"
+    assert pair["response"]["parsed"]["claims"][0]["facet"] == "preference"
+    assert pair["token_usage"]["total_tokens"] == 42
 
 
 def test_boundary_payload_is_encrypted_and_runtime_behavior_is_split(smoke_orchestrator, temp_canonical_db):

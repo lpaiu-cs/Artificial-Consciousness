@@ -86,9 +86,11 @@ SOCIAL_SENSITIVITY = 5.0
 BOT_NAME = "코봇"
 
 # === API Logging Config ===
-API_LOGGING_ENABLED = False         # 민감 데이터가 기본으로 기록되지 않도록 안전 기본값 적용
-API_LOG_FILE = "api_logs.jsonl"     # 로그 파일 경로
-API_LOG_LEVEL = "WARNING"           # WARNING 이상만 기본 기록
-API_LOG_INCLUDE_CONTENT = False     # 기본적으로 프롬프트/응답 원문은 기록하지 않음
-API_LOG_MAX_CONTENT_LENGTH = 500    # 로그에 기록할 최대 콘텐츠 길이 (truncate)
-API_LOG_EXCLUDE_EMBEDDING = False   # Embedding 로그 제외 (True면 채팅만 기록)
+API_LOGGING_ENABLED = os.getenv("API_LOGGING_ENABLED", "false").lower() not in {"0", "false", "no", "off"}
+API_LOG_FILE = os.getenv("API_LOG_FILE", "api_logs.jsonl") or "api_logs.jsonl"
+API_LOG_LEVEL = os.getenv("API_LOG_LEVEL", "INFO") or "INFO"
+API_LOG_INCLUDE_PAIR = os.getenv("API_LOG_INCLUDE_PAIR", "true").lower() not in {"0", "false", "no", "off"}
+API_LOG_INCLUDE_CONTENT = os.getenv("API_LOG_INCLUDE_CONTENT", "false").lower() not in {"0", "false", "no", "off"}
+API_LOG_INCLUDE_PARSED_RESPONSE = os.getenv("API_LOG_INCLUDE_PARSED_RESPONSE", "true").lower() not in {"0", "false", "no", "off"}
+API_LOG_MAX_CONTENT_LENGTH = int(os.getenv("API_LOG_MAX_CONTENT_LENGTH", "500"))
+API_LOG_EXCLUDE_EMBEDDING = os.getenv("API_LOG_EXCLUDE_EMBEDDING", "false").lower() not in {"0", "false", "no", "off"}

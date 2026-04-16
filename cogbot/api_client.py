@@ -2,6 +2,7 @@ import logging
 import json
 import time
 import os
+import uuid
 from typing import List, Any, Optional, Union
 from datetime import datetime
 
@@ -29,6 +30,8 @@ class APILogger:
             self.log_level = "WARNING"
             self.exclude_embedding = True
             self.include_content = False
+            self.include_pair = False
+            self.include_parsed_response = False
             return
             
         self.log_file = log_file or getattr(config, 'API_LOG_FILE', 'api_logs.jsonl')
@@ -37,6 +40,8 @@ class APILogger:
         self.log_level = getattr(config, 'API_LOG_LEVEL', 'DEBUG')
         self.exclude_embedding = exclude_embedding if exclude_embedding is not None else getattr(config, 'API_LOG_EXCLUDE_EMBEDDING', False)
         self.include_content = getattr(config, 'API_LOG_INCLUDE_CONTENT', False)
+        self.include_pair = getattr(config, 'API_LOG_INCLUDE_PAIR', True)
+        self.include_parsed_response = getattr(config, 'API_LOG_INCLUDE_PARSED_RESPONSE', True)
         
     def set_enabled(self, enabled: bool):
         """로깅 on/off 토글"""
@@ -59,6 +64,30 @@ class APILogger:
         if self.include_content and text:
             entry["preview"] = text[:preview_len]
         return entry
+
+    def _new_call_id(self) -> str:
+        """요청/응답을 같은 호출로 묶는 ID"""
+        return uuid.uuid4().hex
+
+    def _schema_name(self, json_schema: Optional[dict] = None) -> Optional[str]:
+        if not isinstance(json_schema, dict):
+            return None
+        if json_schema.get("name"):
+            return json_schema.get("name")
+        nested = json_schema.get("json_schema")
+        if isinstance(nested, dict):
+            return nested.get("name")
+        return None
+
+    def _json_safe(self, value: Any) -> Any:
+        """로그 JSON 직렬화가 깨지지 않도록 복합 값을 정규화"""
+        if isinstance(value, dict):
+            return {str(k): self._json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._json_safe(v) for v in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
     
     def _should_log(self, level: str) -> bool:
         """로그 레벨 체크"""
@@ -76,30 +105,42 @@ class APILogger:
         entry["level"] = level
         
         try:
+            log_dir = os.path.dirname(os.path.abspath(self.log_file))
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
             with open(self.log_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
         except Exception as e:
             logging.error(f"API Log Write Error: {e}")
     
-    def log_embedding_request(self, text: str, model: str):
+    def log_embedding_request(self, text: str, model: str, call_id: str = None):
         """임베딩 요청 로그"""
+        call_id = call_id or self._new_call_id()
         if self.exclude_embedding:
-            return
+            return call_id
         entry = {
             "type": "EMBEDDING_REQUEST",
+            "call_id": call_id,
+            "operation": "embedding",
             "model": model,
             "input_length": len(text) if text else 0
         }
         if self.include_content:
             entry["input_text"] = self._truncate_embedding(text)
         self.log(entry, level="DEBUG")
+        return call_id
     
-    def log_embedding_response(self, text: str, embedding_dim: int, duration_ms: float, success: bool, error: str = None):
+    def log_embedding_response(self, text: str, embedding_dim: int, duration_ms: float, success: bool,
+                               error: str = None, call_id: str = None, model: str = None):
         """임베딩 응답 로그"""
+        call_id = call_id or self._new_call_id()
         if self.exclude_embedding:
-            return
+            return call_id
         entry = {
             "type": "EMBEDDING_RESPONSE",
+            "call_id": call_id,
+            "operation": "embedding",
+            "model": model,
             "embedding_dim": embedding_dim,
             "duration_ms": round(duration_ms, 2),
             "success": success
@@ -109,36 +150,124 @@ class APILogger:
         if error:
             entry["error"] = str(error)
         self.log(entry, level="INFO" if success else "ERROR")
+        return call_id
+
+    def log_embedding_call(self, text: str, model: str, embedding_dim: int, duration_ms: float,
+                           success: bool, error: str = None, call_id: str = None):
+        """임베딩 요청/응답 쌍 로그"""
+        call_id = call_id or self._new_call_id()
+        if self.exclude_embedding or not self.include_pair:
+            return call_id
+        entry = {
+            "type": "EMBEDDING_CALL",
+            "call_id": call_id,
+            "operation": "embedding",
+            "model": model,
+            "request": {"input": self._build_text_meta(text)},
+            "response": {"embedding_dim": embedding_dim},
+            "duration_ms": round(duration_ms, 2),
+            "success": success,
+        }
+        if error:
+            entry["error"] = str(error)
+        self.log(entry, level="INFO" if success else "ERROR")
+        return call_id
     
     def log_chat_request(self, provider: str, model: str, system_prompt: str, user_prompt: str,
-                         json_mode: bool = False, response_format: str = None):
+                         json_mode: bool = False, response_format: str = None,
+                         call_id: str = None, operation: str = "chat",
+                         json_schema: Optional[dict] = None):
         """채팅 요청 로그"""
-        self.log({
+        call_id = call_id or self._new_call_id()
+        entry = {
             "type": "CHAT_REQUEST",
+            "call_id": call_id,
+            "operation": operation,
             "provider": provider,
             "model": model,
             "system_prompt": self._build_text_meta(system_prompt),
             "user_prompt": self._build_text_meta(user_prompt),
             "json_mode": json_mode,
-            "response_format": response_format
-        }, level="DEBUG")
+            "response_format": response_format,
+            "schema_name": self._schema_name(json_schema),
+        }
+        if self.include_content and json_schema:
+            entry["json_schema"] = self._json_safe(json_schema)
+        self.log(entry, level="DEBUG")
+        return call_id
     
     def log_chat_response(self, provider: str, model: str, response: str, duration_ms: float, 
-                          success: bool, token_usage: dict = None, error: str = None):
+                          success: bool, token_usage: dict = None, error: str = None,
+                          call_id: str = None, operation: str = "chat",
+                          json_mode: bool = False, response_format: str = None,
+                          parsed_response: Any = None):
         """채팅 응답 로그"""
+        call_id = call_id or self._new_call_id()
         entry = {
             "type": "CHAT_RESPONSE",
+            "call_id": call_id,
+            "operation": operation,
             "provider": provider,
             "model": model,
             "response": self._build_text_meta(str(response) if response else ""),
             "duration_ms": round(duration_ms, 2),
-            "success": success
+            "success": success,
+            "json_mode": json_mode,
+            "response_format": response_format,
         }
         if token_usage:
-            entry["token_usage"] = token_usage
+            entry["token_usage"] = self._json_safe(token_usage)
+        if self.include_content and self.include_parsed_response and parsed_response is not None:
+            entry["parsed_response"] = self._json_safe(parsed_response)
         if error:
             entry["error"] = str(error)
         self.log(entry, level="INFO" if success else "ERROR")
+        return call_id
+
+    def log_chat_pair(self, provider: str, model: str, system_prompt: str, user_prompt: str,
+                      response: str, duration_ms: float, success: bool,
+                      token_usage: dict = None, error: str = None, call_id: str = None,
+                      operation: str = "chat", json_mode: bool = False,
+                      response_format: str = None, parsed_response: Any = None,
+                      json_schema: Optional[dict] = None):
+        """채팅 API 요청/응답을 한 JSON 레코드로 묶어 기록"""
+        call_id = call_id or self._new_call_id()
+        if not self.include_pair:
+            return call_id
+
+        request_entry = {
+            "system_prompt": self._build_text_meta(system_prompt),
+            "user_prompt": self._build_text_meta(user_prompt),
+        }
+        if self.include_content and json_schema:
+            request_entry["json_schema"] = self._json_safe(json_schema)
+
+        response_entry = {
+            "content": self._build_text_meta(str(response) if response else ""),
+        }
+        if self.include_content and self.include_parsed_response and parsed_response is not None:
+            response_entry["parsed"] = self._json_safe(parsed_response)
+
+        entry = {
+            "type": "CHAT_CALL",
+            "call_id": call_id,
+            "operation": operation,
+            "provider": provider,
+            "model": model,
+            "request": request_entry,
+            "response": response_entry,
+            "duration_ms": round(duration_ms, 2),
+            "success": success,
+            "json_mode": json_mode,
+            "response_format": response_format,
+            "schema_name": self._schema_name(json_schema),
+        }
+        if token_usage:
+            entry["token_usage"] = self._json_safe(token_usage)
+        if error:
+            entry["error"] = str(error)
+        self.log(entry, level="INFO" if success else "ERROR")
+        return call_id
 
 
 class UnifiedAPIClient:
@@ -270,7 +399,7 @@ class UnifiedAPIClient:
             return [0.0] * 1536  # Mock return on failure
 
         # 로그: 요청
-        self.logger.log_embedding_request(text, config.EMBEDDING_MODEL)
+        call_id = self.logger.log_embedding_request(text, config.EMBEDDING_MODEL)
         start_time = time.time()
         
         try:
@@ -283,13 +412,45 @@ class UnifiedAPIClient:
             
             # 로그: 성공 응답
             duration_ms = (time.time() - start_time) * 1000
-            self.logger.log_embedding_response(text, len(embedding), duration_ms, success=True)
+            self.logger.log_embedding_response(
+                text,
+                len(embedding),
+                duration_ms,
+                success=True,
+                call_id=call_id,
+                model=config.EMBEDDING_MODEL,
+            )
+            self.logger.log_embedding_call(
+                text,
+                config.EMBEDDING_MODEL,
+                len(embedding),
+                duration_ms,
+                success=True,
+                call_id=call_id,
+            )
             
             return embedding
         except Exception as e:
             # 로그: 에러
             duration_ms = (time.time() - start_time) * 1000
-            self.logger.log_embedding_response(text, 0, duration_ms, success=False, error=str(e))
+            self.logger.log_embedding_response(
+                text,
+                0,
+                duration_ms,
+                success=False,
+                error=str(e),
+                call_id=call_id,
+                model=config.EMBEDDING_MODEL,
+            )
+            self.logger.log_embedding_call(
+                text,
+                config.EMBEDDING_MODEL,
+                0,
+                duration_ms,
+                success=False,
+                error=str(e),
+                call_id=call_id,
+            )
             logging.error(f"Embedding Error: {e}")
             return [0.0] * 1536
 
@@ -299,7 +460,14 @@ class UnifiedAPIClient:
             return "(Groq N/A)"
 
         # 로그: 요청
-        self.logger.log_chat_request("Groq", config.FAST_MODEL, system_prompt, user_prompt)
+        call_id = self.logger.log_chat_request(
+            "Groq",
+            config.FAST_MODEL,
+            system_prompt,
+            user_prompt,
+            operation="chat_fast",
+            response_format="text",
+        )
         start_time = time.time()
         
         try:
@@ -322,15 +490,59 @@ class UnifiedAPIClient:
                     "completion_tokens": response.usage.completion_tokens,
                     "total_tokens": response.usage.total_tokens
                 }
-            self.logger.log_chat_response("Groq", config.FAST_MODEL, content, duration_ms, 
-                                          success=True, token_usage=token_usage)
+            self.logger.log_chat_response(
+                "Groq",
+                config.FAST_MODEL,
+                content,
+                duration_ms,
+                success=True,
+                token_usage=token_usage,
+                call_id=call_id,
+                operation="chat_fast",
+                response_format="text",
+            )
+            self.logger.log_chat_pair(
+                "Groq",
+                config.FAST_MODEL,
+                system_prompt,
+                user_prompt,
+                content,
+                duration_ms,
+                success=True,
+                token_usage=token_usage,
+                call_id=call_id,
+                operation="chat_fast",
+                response_format="text",
+            )
             
             return content
         except Exception as e:
             # 로그: 에러
             duration_ms = (time.time() - start_time) * 1000
-            self.logger.log_chat_response("Groq", config.FAST_MODEL, None, duration_ms, 
-                                          success=False, error=str(e))
+            self.logger.log_chat_response(
+                "Groq",
+                config.FAST_MODEL,
+                None,
+                duration_ms,
+                success=False,
+                error=str(e),
+                call_id=call_id,
+                operation="chat_fast",
+                response_format="text",
+            )
+            self.logger.log_chat_pair(
+                "Groq",
+                config.FAST_MODEL,
+                system_prompt,
+                user_prompt,
+                None,
+                duration_ms,
+                success=False,
+                error=str(e),
+                call_id=call_id,
+                operation="chat_fast",
+                response_format="text",
+            )
             logging.error(f"Groq Chat Error: {e}")
             return "(Fast Inference Failed)"
 
@@ -342,13 +554,15 @@ class UnifiedAPIClient:
 
         # 로그: 요청
         response_format = "json_schema" if json_schema else ("json_object" if json_mode else "text")
-        self.logger.log_chat_request(
+        call_id = self.logger.log_chat_request(
             "OpenAI",
             config.SMART_MODEL,
             system_prompt,
             user_prompt,
             json_mode or bool(json_schema),
             response_format=response_format,
+            operation="chat_slow",
+            json_schema=json_schema,
         )
         start_time = time.time()
 
@@ -368,15 +582,20 @@ class UnifiedAPIClient:
             elif json_mode:
                 params["response_format"] = {"type": "json_object"}
 
-            return self._run_chat_completion(params, expect_json=json_mode or bool(json_schema), start_time=start_time)
+            return self._run_chat_completion(
+                params,
+                expect_json=json_mode or bool(json_schema),
+                start_time=start_time,
+                call_id=call_id,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                response_format=response_format,
+                operation="chat_slow",
+                json_schema=json_schema,
+            )
         except Exception as e:
             if json_schema:
-                logging.warning(f"Structured output fallback to json_object: {e}")
-                try:
-                    params = dict(base_params)
-                    params["response_format"] = {"type": "json_object"}
-                    return self._run_chat_completion(params, expect_json=True, start_time=start_time)
-                except Exception as fallback_error:
+                if not getattr(e, "_api_log_recorded", False):
                     duration_ms = (time.time() - start_time) * 1000
                     self.logger.log_chat_response(
                         "OpenAI",
@@ -384,18 +603,103 @@ class UnifiedAPIClient:
                         None,
                         duration_ms,
                         success=False,
-                        error=str(fallback_error),
+                        error=str(e),
+                        call_id=call_id,
+                        operation="chat_slow",
+                        json_mode=True,
+                        response_format=response_format,
                     )
+                    self.logger.log_chat_pair(
+                        "OpenAI",
+                        config.SMART_MODEL,
+                        system_prompt,
+                        user_prompt,
+                        None,
+                        duration_ms,
+                        success=False,
+                        error=str(e),
+                        call_id=call_id,
+                        operation="chat_slow",
+                        json_mode=True,
+                        response_format=response_format,
+                        json_schema=json_schema,
+                    )
+                logging.warning(f"Structured output fallback to json_object: {e}")
+                try:
+                    params = dict(base_params)
+                    params["response_format"] = {"type": "json_object"}
+                    fallback_call_id = self.logger.log_chat_request(
+                        "OpenAI",
+                        config.SMART_MODEL,
+                        system_prompt,
+                        user_prompt,
+                        True,
+                        response_format="json_object",
+                        operation="chat_slow_fallback",
+                    )
+                    return self._run_chat_completion(
+                        params,
+                        expect_json=True,
+                        start_time=start_time,
+                        call_id=fallback_call_id,
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        response_format="json_object",
+                        operation="chat_slow_fallback",
+                    )
+                except Exception as fallback_error:
+                    if not getattr(fallback_error, "_api_log_recorded", False):
+                        duration_ms = (time.time() - start_time) * 1000
+                        self.logger.log_chat_response(
+                            "OpenAI",
+                            config.SMART_MODEL,
+                            None,
+                            duration_ms,
+                            success=False,
+                            error=str(fallback_error),
+                            call_id=fallback_call_id,
+                            operation="chat_slow_fallback",
+                            json_mode=True,
+                            response_format="json_object",
+                        )
+                        self.logger.log_chat_pair(
+                            "OpenAI",
+                            config.SMART_MODEL,
+                            system_prompt,
+                            user_prompt,
+                            None,
+                            duration_ms,
+                            success=False,
+                            error=str(fallback_error),
+                            call_id=fallback_call_id,
+                            operation="chat_slow_fallback",
+                            json_mode=True,
+                            response_format="json_object",
+                        )
                     logging.error(f"OpenAI Chat Error: {fallback_error}")
                     return {}
 
             duration_ms = (time.time() - start_time) * 1000
-            self.logger.log_chat_response("OpenAI", config.SMART_MODEL, None, duration_ms,
-                                          success=False, error=str(e))
+            if not getattr(e, "_api_log_recorded", False):
+                self.logger.log_chat_response("OpenAI", config.SMART_MODEL, None, duration_ms,
+                                              success=False, error=str(e),
+                                              call_id=call_id,
+                                              operation="chat_slow",
+                                              json_mode=json_mode or bool(json_schema),
+                                              response_format=response_format)
+                self.logger.log_chat_pair("OpenAI", config.SMART_MODEL, system_prompt, user_prompt,
+                                          None, duration_ms, success=False, error=str(e),
+                                          call_id=call_id, operation="chat_slow",
+                                          json_mode=json_mode or bool(json_schema),
+                                          response_format=response_format,
+                                          json_schema=json_schema)
             logging.error(f"OpenAI Chat Error: {e}")
             return {} if json_mode else f"(Smart Inference Failed: {e})"
 
-    def _run_chat_completion(self, params: dict, expect_json: bool, start_time: float) -> Union[str, dict]:
+    def _run_chat_completion(self, params: dict, expect_json: bool, start_time: float,
+                             call_id: str, system_prompt: str, user_prompt: str,
+                             response_format: str, operation: str,
+                             json_schema: Optional[dict] = None) -> Union[str, dict]:
         response = self.openai_client.chat.completions.create(**params)
         content = response.choices[0].message.content or ("{}" if expect_json else "")
 
@@ -408,7 +712,68 @@ class UnifiedAPIClient:
                 "total_tokens": response.usage.total_tokens
             }
 
-        result = json.loads(content) if expect_json else content
-        self.logger.log_chat_response("OpenAI", config.SMART_MODEL, content, duration_ms,
-                                      success=True, token_usage=token_usage)
+        try:
+            result = json.loads(content) if expect_json else content
+        except Exception as parse_error:
+            self.logger.log_chat_response(
+                "OpenAI",
+                config.SMART_MODEL,
+                content,
+                duration_ms,
+                success=False,
+                token_usage=token_usage,
+                error=f"JSON parse error: {parse_error}",
+                call_id=call_id,
+                operation=operation,
+                json_mode=expect_json,
+                response_format=response_format,
+            )
+            self.logger.log_chat_pair(
+                "OpenAI",
+                config.SMART_MODEL,
+                system_prompt,
+                user_prompt,
+                content,
+                duration_ms,
+                success=False,
+                token_usage=token_usage,
+                error=f"JSON parse error: {parse_error}",
+                call_id=call_id,
+                operation=operation,
+                json_mode=expect_json,
+                response_format=response_format,
+                json_schema=json_schema,
+            )
+            setattr(parse_error, "_api_log_recorded", True)
+            raise
+
+        self.logger.log_chat_response(
+            "OpenAI",
+            config.SMART_MODEL,
+            content,
+            duration_ms,
+            success=True,
+            token_usage=token_usage,
+            call_id=call_id,
+            operation=operation,
+            json_mode=expect_json,
+            response_format=response_format,
+            parsed_response=result if expect_json else None,
+        )
+        self.logger.log_chat_pair(
+            "OpenAI",
+            config.SMART_MODEL,
+            system_prompt,
+            user_prompt,
+            content,
+            duration_ms,
+            success=True,
+            token_usage=token_usage,
+            call_id=call_id,
+            operation=operation,
+            json_mode=expect_json,
+            response_format=response_format,
+            parsed_response=result if expect_json else None,
+            json_schema=json_schema,
+        )
         return result

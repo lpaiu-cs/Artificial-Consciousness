@@ -31,8 +31,10 @@ class MockUnifiedAPIClient:
             'set_enabled': lambda self, x: None,
             'log_embedding_request': lambda self, *args: None,
             'log_embedding_response': lambda self, *args, **kwargs: None,
+            'log_embedding_call': lambda self, *args, **kwargs: None,
             'log_chat_request': lambda self, *args, **kwargs: None,
             'log_chat_response': lambda self, *args, **kwargs: None,
+            'log_chat_pair': lambda self, *args, **kwargs: None,
         })()
     
     def set_logging(self, enabled: bool):
